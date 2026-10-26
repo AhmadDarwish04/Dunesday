@@ -13,6 +13,14 @@
       "cinema_slug": "city-centre-almaza",
       "target": { "date": "2026-08-20" },
       "notify_on": "bookable"
+    },
+    {
+      "id": "sense-almaza-oct29",
+      "site": "vox",
+      "movie_slug": "sense-and-sensibility",
+      "cinema_slug": "city-centre-almaza",
+      "target": { "date": "2026-10-29" },
+      "notify_on": "bookable"
     }
   ]
 }
