@@ -1,8 +1,8 @@
-"""Poll cinema sites for showtimes on a target date and notify via Telegram.
+"""Poll cinema sites for showtimes on a target date and alert via Telegram or Discord.
 
 Watches are declared in `watches.json`; each one names a site adapter, a movie, and a
 target date (either a fixed calendar date or "the next occurrence of a weekday"). Every
-run checks all of them independently and sends one Telegram message per watch that has
+run checks all of them independently and sends one Alert per Watch that has
 just gone live.
 
 Two sites are supported, and both share the same core signal: **no showtimes parsed means
@@ -25,10 +25,10 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -78,11 +78,12 @@ log = logging.getLogger("showtime_notifier")
 
 @dataclass(frozen=True)
 class Config:
-    """Telegram credentials and run-wide defaults, from environment variables."""
+    """Channel credentials and run-wide defaults, from environment variables."""
     telegram_token: str
     telegram_chat_id: str
     default_timezone: str
     watches_path: Path
+    discord_webhook_url: str
 
 
 NOTIFY_MODES = ("published", "bookable")
@@ -105,6 +106,8 @@ class Watch:
     target_weekday: str = ""
     target_date: Optional[date] = None
     notify_on: str = "published"
+    channels: list[str] = field(default_factory=lambda: ["telegram", "discord"])
+    mention: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -139,22 +142,25 @@ class Site:
     default_cinema: str = ""
 
 
-def load_config() -> Config:
-    """Read and validate required env vars; raise on missing required ones."""
-    required = {
-        "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN"),
-        "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID"),
-    }
-    missing = [k for k, v in required.items() if not v]
+def load_config(watches: list[Watch], env: Mapping[str, str]) -> Config:
+    """Validate credentials only for Channels used by the supplied Watches."""
+    channels = {channel for watch in watches for channel in watch.channels}
+    required = []
+    if "telegram" in channels:
+        required.extend(["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"])
+    if "discord" in channels:
+        required.append("DISCORD_WEBHOOK_URL")
+    missing = [key for key in required if not env.get(key, "").strip()]
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-    watches_path = os.environ.get("WATCHES_FILE")
+    watches_path = env.get("WATCHES_FILE")
     return Config(
-        telegram_token=required["TELEGRAM_BOT_TOKEN"],
-        telegram_chat_id=required["TELEGRAM_CHAT_ID"],
-        default_timezone=(os.environ.get("TIMEZONE") or "Africa/Cairo").strip(),
+        telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=env.get("TELEGRAM_CHAT_ID", ""),
+        default_timezone=(env.get("TIMEZONE") or "Africa/Cairo").strip(),
         watches_path=Path(watches_path) if watches_path else DEFAULT_WATCHES_PATH,
+        discord_webhook_url=env.get("DISCORD_WEBHOOK_URL", ""),
     )
 
 
@@ -217,6 +223,21 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
             raise RuntimeError(
                 f"{where}: notify_on must be one of {list(NOTIFY_MODES)}, got {notify_on!r}")
 
+        channels = e.get("channels", ["telegram", "discord"])
+        if not isinstance(channels, list) or not channels:
+            raise RuntimeError(f"{where}: channels must be a non-empty list")
+        for channel in channels:
+            if channel not in ("telegram", "discord"):
+                raise RuntimeError(f"{where}: unknown channel {channel!r}; expected telegram or discord")
+        if len(set(channels)) != len(channels):
+            raise RuntimeError(f"{where}: duplicate channel in channels")
+
+        mention = e.get("mention", [])
+        if not isinstance(mention, list):
+            raise RuntimeError(f"{where}: mention must be a list of Discord user ID strings")
+        if any(not isinstance(uid, str) or not re.fullmatch(r"[0-9]+", uid) for uid in mention):
+            raise RuntimeError(f"{where}: mention must contain numeric Discord user ID strings")
+
         tz = str(e.get("timezone") or "").strip() or default_timezone
         try:
             ZoneInfo(tz)
@@ -233,6 +254,8 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
             target_weekday=weekday,
             target_date=fixed,
             notify_on=notify_on,
+            channels=channels,
+            mention=mention,
         ))
     return watches
 
@@ -488,6 +511,56 @@ def format_message(movie: str, cinema: str, target_date: date,
     return "\n".join(lines)
 
 
+def format_discord_message(movie: str, cinema: str, target_date: date,
+                           groups: "dict[str, list[Showtime]]",
+                           soldout_label: str = "sold out",
+                           headline: str = "showtimes are live!") -> str:
+    """Format the same Date watch in Discord markdown."""
+    date_str = f"{target_date:%A, %B} {target_date.day}, {target_date:%Y}"
+    lines = [f"\U0001f3ac **{movie}** {headline}", f"\U0001f4cd {cinema}", f"\U0001f4c5 {date_str}"]
+    for experience, times in groups.items():
+        lines.extend(["", f"**{experience}**"])
+        for st in times:
+            if st.soldout:
+                lines.append(f"\u2022 ~~{st.time}~~ ({soldout_label})")
+            elif st.href:
+                lines.append(f"\u2022 [{st.time}]({st.href})")
+            else:
+                lines.append(f"\u2022 {st.time}")
+    return "\n".join(lines)
+
+
+def build_alert(watch: Watch, movie: str, cinema: str, target: date,
+                groups: "dict[str, list[Showtime]]", soldout_label: str,
+                headline: str) -> Alert:
+    """Render only the Watch's chosen Channels, including Discord Mentions."""
+    texts = {}
+    for channel in watch.channels:
+        formatter = format_message if channel == "telegram" else format_discord_message
+        text = formatter(movie, cinema, target, groups, soldout_label, headline)
+        if channel == "discord" and watch.mention:
+            text = " ".join(f"<@{uid}>" for uid in watch.mention) + "\n" + text
+        texts[channel] = text
+    return Alert(texts=texts, mentions=list(watch.mention))
+
+
+def split_discord_text(text: str) -> list[str]:
+    """Keep lines together within 2000 characters; hard-split an oversized line."""
+    chunks = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > 2000:
+            chunks.append(current)
+            current = ""
+        while len(line) > 2000:
+            chunks.append(line[:2000])
+            line = line[2000:]
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def send_telegram(token: str, chat_id: str, text: str) -> None:
     """POST a message to the Telegram Bot API; raise on failure."""
     r = requests.post(
@@ -505,6 +578,35 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
     body = r.json()
     if not body.get("ok"):
         raise RuntimeError(f"Telegram API returned not-ok: {body}")
+
+
+def send_discord(webhook_url: str, text: str, mentions: list[str]) -> None:
+    """POST each part to Discord, permitting only the Watch's listed user Mentions."""
+    for content in split_discord_text(text):
+        r = requests.post(
+            webhook_url,
+            json={"content": content, "allowed_mentions": {"parse": [], "users": mentions}},
+            timeout=20,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Discord API error {r.status_code}: {r.text}")
+
+
+def send_alert(cfg: Config, alert: Alert) -> None:
+    """Attempt every Channel; any failure prevents this Watch's state being committed."""
+    failures = []
+    for channel, text in alert.texts.items():
+        try:
+            if channel == "telegram":
+                send_telegram(cfg.telegram_token, cfg.telegram_chat_id, text)
+            elif channel == "discord":
+                send_discord(cfg.discord_webhook_url, text, alert.mentions)
+            else:
+                raise RuntimeError(f"unknown channel {channel!r}")
+        except Exception as exc:  # noqa: BLE001 — attempt the other Channels too
+            failures.append(f"{channel}: {exc}")
+    if failures:
+        raise RuntimeError("Channel delivery failed: " + "; ".join(failures))
 
 
 # ---------------------------------------------------------------------------- state
@@ -584,10 +686,10 @@ def run_watch(watch: Watch, fetch: Callable[[str, dict], str], state: dict,
 
     movie, cinema = site.display_names(html, watch)
     headline = "is now bookable!" if watch.notify_on == "bookable" else "showtimes are live!"
-    text = format_message(movie, cinema, target, groups,
-                          soldout_label=site.soldout_label, headline=headline)
+    alert = build_alert(watch, movie, cinema, target, groups,
+                        soldout_label=site.soldout_label, headline=headline)
     next_state = {**state, "notified_for": {**state["notified_for"], watch.id: dedupe_key}}
-    return [Alert(texts={"telegram": text}, mentions=[])], next_state
+    return [alert], next_state
 
 
 def main() -> int:
@@ -597,8 +699,9 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    cfg = load_config()
+    cfg = load_config([], os.environ)
     watches = load_watches(cfg.watches_path, cfg.default_timezone)
+    cfg = load_config(watches, os.environ)
     state = load_state(DEFAULT_STATE_PATH, watches)
     log.info("loaded %d watch(es): %s", len(watches), ", ".join(w.id for w in watches))
 
@@ -609,9 +712,9 @@ def main() -> int:
             alerts, next_state = run_watch(
                 watch, fetch_page, state, datetime.now(ZoneInfo(watch.timezone)))
             for alert in alerts:
-                send_telegram(cfg.telegram_token, cfg.telegram_chat_id, alert.texts["telegram"])
-                log.info("[%s] Telegram notification sent for %s",
-                         watch.id, next_state["notified_for"][watch.id])
+                send_alert(cfg, alert)
+                log.info("[%s] Alert sent to %s for %s", watch.id, ", ".join(alert.texts),
+                         next_state["notified_for"][watch.id])
             if next_state != state:
                 state = next_state
                 changed = True

@@ -30,7 +30,9 @@ Credentials live in GitHub secrets (`gh secret set`); **what** to watch lives in
 the repo. Verify end-to-end with `gh workflow run test-telegram.yml` (delivery only) or
 `gh workflow run check-showtimes.yml` (full scrape + parse + notify).
 
-Env vars: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are required. `TIMEZONE` (default
+Env vars: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are required if any Watch routes to
+Telegram; `DISCORD_WEBHOOK_URL` is required if any Watch routes to Discord. Watch `channels`
+defaults to both. `TIMEZONE` (default
 `Africa/Cairo`) is the fallback for watches that don't set their own. `WATCHES_FILE` overrides the
 `watches.json` path — the safe way to test config changes. A local `.env` is gitignored and read
 only by `get_chat_id.py` / `send_test_message.py`.

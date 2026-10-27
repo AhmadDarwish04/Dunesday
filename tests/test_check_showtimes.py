@@ -16,6 +16,7 @@ from check_showtimes import (  # noqa: E402
     Showtime,
     Watch,
     format_message,
+    load_config,
     load_state,
     load_watches,
     next_target_date,
@@ -288,6 +289,96 @@ def test_load_watches_defaults_notify_on_to_published(tmp_path):
     assert load_watches(path, "Africa/Cairo")[0].notify_on == "published"
 
 
+@pytest.mark.parametrize("options,channels,mentions", [
+    ({}, ["telegram", "discord"], []),
+    ({"channels": ["discord"], "mention": ["123", "456"]}, ["discord"], ["123", "456"]),
+    ({"channels": ["telegram"], "mention": []}, ["telegram"], []),
+])
+def test_load_watches_channel_and_mention_options(tmp_path, options, channels, mentions):
+    path = _write_watches(tmp_path, [
+        {"id": "a", "site": "scene", "movie_slug": "m",
+         "target": {"weekday": "friday"}, **options},
+    ])
+    watch = load_watches(path)[0]
+    assert watch.channels == channels
+    assert watch.mention == mentions
+
+
+@pytest.mark.parametrize("options,message", [
+    ({"channels": []}, "channels must be a non-empty list"),
+    ({"channels": "discord"}, "channels must be a non-empty list"),
+    ({"channels": None}, "channels must be a non-empty list"),
+    ({"channels": ["email"]}, "unknown channel"),
+    ({"channels": [123]}, "unknown channel"),
+    ({"channels": [["discord"]]}, "unknown channel"),
+    ({"channels": ["discord", "discord"]}, "duplicate channel"),
+    ({"mention": "123"}, "mention must be a list"),
+    ({"mention": None}, "mention must be a list"),
+    ({"mention": [123]}, "Discord user ID strings"),
+    ({"mention": [True]}, "Discord user ID strings"),
+    ({"mention": [""]}, "Discord user ID strings"),
+    ({"mention": [" 123"]}, "Discord user ID strings"),
+    ({"mention": ["-123"]}, "Discord user ID strings"),
+    ({"mention": ["1.2"]}, "Discord user ID strings"),
+    ({"mention": ["\u0661\u0662\u0663"]}, "Discord user ID strings"),
+    ({"mention": ["@everyone"]}, "Discord user ID strings"),
+    ({"mention": ["<@123>"]}, "Discord user ID strings"),
+])
+def test_load_watches_rejects_bad_channels_and_mentions(tmp_path, options, message):
+    path = _write_watches(tmp_path, [
+        {"id": "a", "site": "scene", "movie_slug": "m",
+         "target": {"weekday": "friday"}, **options},
+    ])
+    with pytest.raises(RuntimeError, match=message):
+        load_watches(path)
+
+
+@pytest.mark.parametrize("routes,env,missing", [
+    ([["telegram"]], {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "chat"}, []),
+    ([["discord"]], {"DISCORD_WEBHOOK_URL": "https://discord.example/webhook"}, []),
+    ([["telegram", "discord"]], {},
+     ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "DISCORD_WEBHOOK_URL"]),
+    ([["telegram"], ["discord"]], {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "chat"},
+     ["DISCORD_WEBHOOK_URL"]),
+    ([["discord"], ["telegram"]], {"DISCORD_WEBHOOK_URL": "url"},
+     ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]),
+    ([["telegram"]], {"TELEGRAM_BOT_TOKEN": "token"}, ["TELEGRAM_CHAT_ID"]),
+    ([["telegram"]], {"TELEGRAM_CHAT_ID": "chat"}, ["TELEGRAM_BOT_TOKEN"]),
+    ([["discord"]], {"DISCORD_WEBHOOK_URL": ""}, ["DISCORD_WEBHOOK_URL"]),
+    ([["discord"]], {"DISCORD_WEBHOOK_URL": "   "}, ["DISCORD_WEBHOOK_URL"]),
+])
+def test_credentials_required_only_for_routed_channels(routes, env, missing):
+    watches = [Watch(id=str(i), site="scene", movie_slug="m", timezone="Africa/Cairo",
+                     channels=channels) for i, channels in enumerate(routes)]
+    if missing:
+        with pytest.raises(RuntimeError) as exc:
+            load_config(watches, env)
+        assert str(exc.value) == "Missing required env vars: " + ", ".join(missing)
+    else:
+        cfg = load_config(watches, env)
+        assert cfg.telegram_token == env.get("TELEGRAM_BOT_TOKEN", "")
+        assert cfg.telegram_chat_id == env.get("TELEGRAM_CHAT_ID", "")
+        assert cfg.discord_webhook_url == env.get("DISCORD_WEBHOOK_URL", "")
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("short\nmessage", ["short\nmessage"]),
+    ("a" * 2000, ["a" * 2000]),
+    ("a" * 1200 + "\n" + "b" * 1000, ["a" * 1200 + "\n", "b" * 1000]),
+    ("a" * 1999 + "\n" + "b", ["a" * 1999 + "\n", "b"]),
+    ("a" * 2001, ["a" * 2000, "a"]),
+    ("<@123>\n" + "x" * 1500 + "\n\n" + "y" * 1500,
+     ["<@123>\n" + "x" * 1500 + "\n\n", "y" * 1500]),
+])
+def test_split_discord_text_preserves_lines_and_fits_limit(text, expected):
+    from check_showtimes import split_discord_text
+
+    chunks = split_discord_text(text)
+    assert chunks == expected
+    assert "".join(chunks) == text
+    assert all(0 < len(chunk) <= 2000 for chunk in chunks)
+
+
 def test_load_watches_rejects_bad_notify_on(tmp_path):
     path = _write_watches(tmp_path, [
         {"id": "a", "site": "scene", "movie_slug": "m", "target": {"weekday": "friday"},
@@ -370,6 +461,7 @@ def test_run_date_watch_not_yet_published_is_quiet(site, fixture, url, caplog):
 
 def test_run_date_watch_published_alert_and_dedupe():
     watch = Watch(id="w", site="scene", movie_slug="the-odyssey", timezone="Africa/Cairo",
+                  channels=["telegram"],
                   target_weekday="friday",
                   base_url="https://district5.scenecinemas.com/movie-details/the-odyssey.html")
     url = "https://district5.scenecinemas.com/movie-details/the-odyssey.html?business_day=31-07-2026&ajax=1"
@@ -401,6 +493,7 @@ def test_run_date_watch_published_alert_and_dedupe():
 
 def test_run_fixed_date_watch_holds_off_then_alerts_when_bookable():
     watch = Watch(id="w", site="vox", movie_slug="spider-man-brand-new-day",
+                  channels=["telegram"],
                   timezone="Africa/Cairo", cinema_slug="city-centre-almaza",
                   target_date=date(2026, 8, 6), notify_on="bookable")
     url = "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&m=spider-man-brand-new-day&d=20260806"
@@ -446,12 +539,13 @@ def test_run_date_watch_requires_an_aware_clock():
         run_watch(watch, _fixture_fetch({}), {"notified_for": {}}, datetime(2026, 7, 27, 10))
 
 
-@pytest.mark.parametrize("failure", ["fetch", "delivery"])
+@pytest.mark.parametrize("failure", ["fetch", "delivery", "discord", None])
 def test_main_keeps_failed_watch_state_and_delivers_other_alerts(tmp_path, monkeypatch, failure):
     import check_showtimes as notifier
 
     watches_path = _write_watches(tmp_path, [
         {"id": wid, "site": "vox", "movie_slug": wid, "cinema_slug": "city-centre-almaza",
+         "channels": ["telegram", "discord"], "mention": ["123"],
          "target": {"date": "2026-08-06"}} for wid in ("failed", "successful")
     ])
     state_path = tmp_path / "state.json"
@@ -459,6 +553,7 @@ def test_main_keeps_failed_watch_state_and_delivers_other_alerts(tmp_path, monke
     monkeypatch.setenv("WATCHES_FILE", str(watches_path))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "test-chat")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.example/webhook")
     monkeypatch.setattr(notifier, "DEFAULT_STATE_PATH", state_path)
 
     class FrozenDatetime(datetime):
@@ -488,10 +583,21 @@ def test_main_keeps_failed_watch_state_and_delivers_other_alerts(tmp_path, monke
 
     monkeypatch.setattr(notifier, "fetch_page", fetch)
     monkeypatch.setattr(notifier, "send_telegram", send)
-    assert notifier.main() == 1
+    discord_delivered = []
+
+    def send_discord(webhook_url, text, mentions):
+        assert mentions == ["123"]
+        discord_delivered.append(text)
+        if failure == "discord" and len(discord_delivered) == 1:
+            raise RuntimeError("Discord failed")
+
+    monkeypatch.setattr(notifier, "send_discord", send_discord)
+    assert notifier.main() == (1 if failure else 0)
     assert "showtimes are live!" in delivered[-1]
+    assert len(discord_delivered) == (1 if failure == "fetch" else 2)
+    assert discord_delivered[-1].startswith("<@123>\n")
     assert json.loads(state_path.read_text(encoding="utf-8")) == {
-        "notified_for": {"failed": "20260724", "successful": "20260806"}
+        "notified_for": {"failed": "20260724" if failure else "20260806", "successful": "20260806"}
     }
 
 
@@ -523,3 +629,77 @@ def test_run_published_date_watch_uses_watch_timezone_and_not_bookable_showtimes
     assert "(not bookable)" in alerts[0].texts["telegram"]
     assert next_state == {"notified_for": {"w": "20260731"}}
     assert state == {"notified_for": {}}
+
+
+@pytest.mark.parametrize("routing,expected", [
+    ({}, {"telegram", "discord"}),
+    ({"channels": ["telegram"]}, {"telegram"}),
+    ({"channels": ["discord"]}, {"discord"}),
+    ({"channels": ["discord", "telegram"]}, {"telegram", "discord"}),
+])
+def test_run_date_watch_routes_alert_and_discord_mentions(routing, expected):
+    watch = Watch(id="w", site="vox", movie_slug="spider-man-brand-new-day",
+                  timezone="Africa/Cairo", cinema_slug="city-centre-almaza",
+                  target_date=date(2026, 8, 6), notify_on="bookable",
+                  mention=["123456789", "987654321"], **routing)
+    url = "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&m=spider-man-brand-new-day&d=20260806"
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    alerts, _ = run_watch(watch, _fixture_fetch({url: "vox_with_showtimes.html"}),
+                          {"notified_for": {}}, now)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert set(alert.texts) == expected
+    assert alert.mentions == ["123456789", "987654321"]
+    if "discord" in expected:
+        text = alert.texts["discord"]
+        assert text.startswith("<@123456789> <@987654321>\n")
+        assert "**Spider-Man: Brand New Day** is now bookable!" in text
+        assert "**GOLD**\n\u2022 ~~1:30pm~~ (not bookable)" in text
+        assert "[1:45pm](https://egy.voxcinemas.com/booking/0047-266952)" in text
+        assert "<b>" not in text and '<a href=' not in text
+    if "telegram" in expected:
+        assert '<a href="https://egy.voxcinemas.com/booking/0047-266952">1:45pm</a>' in alert.texts["telegram"]
+        assert "<@" not in alert.texts["telegram"]
+
+
+def test_sample_helper_uses_selected_watch_channels_and_mentions(tmp_path, monkeypatch):
+    import check_showtimes as notifier
+    import send_test_message as helper
+
+    path = _write_watches(tmp_path, [
+        {"id": "discord", "site": "scene", "movie_slug": "m",
+         "target": {"weekday": "friday"}, "channels": ["discord"], "mention": ["123"]},
+        {"id": "telegram", "site": "scene", "movie_slug": "m",
+         "target": {"weekday": "friday"}, "channels": ["telegram"]},
+    ])
+    monkeypatch.setenv("WATCHES_FILE", str(path))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.example/webhook")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    class FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 7, 27)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo")).astimezone(tz)
+
+    monkeypatch.setattr(helper, "date", FrozenDate)
+    monkeypatch.setattr(notifier, "datetime", FrozenDatetime)
+    delivered = []
+
+    def send_discord(webhook_url, text, mentions):
+        delivered.append((webhook_url, text, mentions))
+
+    monkeypatch.setattr(notifier, "send_discord", send_discord)
+    assert helper.main(["discord"]) == 0
+    assert len(delivered) == 1
+    url, text, mentions = delivered[0]
+    assert url == "https://discord.example/webhook"
+    assert mentions == ["123"]
+    assert "**TEST**" in text and "<@123>" in text
+    assert "[04:00 PM](https://district5.scenecinemas.com/showtime-sample1)" in text
+    assert "<b>" not in text
