@@ -143,6 +143,7 @@ Add as many as you like. Each one is checked separately, gets its own message, a
       "vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
       "scene": []
     },
+    "match": ["doomsday"],
     "cinemas": "all",
     "until": "2027-01-31",
     "channels": ["telegram", "discord"],
@@ -154,8 +155,18 @@ Add as many as you like. Each one is checked separately, gets its own message, a
 A Movie watch discovers dates and Cinemas and Alerts on each New Showtime: a Bookable Showtime
 it has not alerted about before. The first run includes already Bookable Showtimes. Use `"all"` or
 a list of Cinema slugs (for example `["city-centre-almaza", "district-5"]`); an empty Site slug
-list skips that Site until you add its Movie slug. `until` is optional and stops the Watch after
-that date. Movie watches always wait for Bookable Showtimes; `target` and `notify_on` belong to
+list uses Movie match discovery when keywords apply to that Site. Set `"match": ["doomsday"]`
+for every supported Site, or `"match": {"scene": ["doomsday"]}` for selected Sites. Keep `movie`
+as a map of slug lists; match-only Watches can use `"movie": {}`. A Movie watch needs at least
+one explicit slug or Movie match. Keywords must be non-empty strings in a non-empty list.
+Every keyword must occur in the slug or title, case-insensitively; hyphens, underscores and
+spaces are equivalent. `doomsday` finds both Doomsday releases; `avengers` also finds Endgame
+Encore, so choose the more specific keyword.
+
+When a matched movie is first Listed, a short heads-up Alert links to its movie page, even
+before Showtimes exist. This happens once per Scene Cinema and once site-wide for VOX;
+explicit slugs never produce heads-up Alerts. `until` is optional and stops the Watch after
+that date. Movie watches wait for Bookable Showtimes before sending Showtime Alerts; `target` and `notify_on` belong to
 Date watches. Both kinds accept `channels`, `mention`, and `timezone`.
 
 ---
@@ -237,7 +248,7 @@ To check the real thing is running: **Actions → Check Showtimes → Run workfl
 { "notified_for": { "odyssey-d5-friday": "20260731" } }
 ```
 
-Movie watch state is stored under `movie_alerted` as Showtime identities and dates; past dates are pruned. To re-arm a Watch, delete its entry from the appropriate section and commit, or rename its id. Deleting the whole file resets everything.
+Movie watch state is stored under `movie_alerted` as Showtime identities and dates; past dates are pruned. Listed heads-up identities are stored under `movie_listed` per Watch and kept indefinitely. Both are saved only after all Alerts for the Watch are delivered. To re-arm a Watch, delete its entry from the appropriate section and commit, or rename its id. Deleting the whole file resets everything.
 
 ---
 

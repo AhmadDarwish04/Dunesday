@@ -99,7 +99,9 @@ def sample_movie_alert(watch: MovieWatch, today: date) -> Alert:
             },
         },
     }
-    slug = next(slug for slugs in watch.movie.values() for slug in slugs)
+    slug = next((slug for slugs in watch.movie.values() for slug in slugs), "")
+    if not slug:
+        slug = " ".join(next(iter(watch.match.values())))
     texts = {channel: CHANNELS[channel].mention_prefix(watch.mention) +
              format_movie_message(channel, title_from_slug(slug), groups, 4)
              for channel in watch.channels}

@@ -237,6 +237,7 @@ def test_repo_watches_file_is_valid():
     assert isinstance(avengers, MovieWatch)
     assert avengers.movie == {"vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
                               "scene": []}
+    assert avengers.match == {"scene": ["doomsday"], "vox": ["doomsday"]}
     assert avengers.cinemas == "all"
     assert avengers.channels == ["telegram", "discord"]
 
@@ -1367,3 +1368,179 @@ def test_run_movie_watch_paces_every_fetch_without_initial_pause(tmp_path):
     run_watch(watch, fetch, {"notified_for": {}}, SCENE_MOVIE_NOW,
               sleep=lambda seconds: events.append(seconds))
     assert events == ["fetch"] + [1, "fetch"] * 13
+
+
+def test_movie_match_config_supports_shared_and_per_site_keywords(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"vox": [], "scene": []}, match=["doomsday"])
+    assert watch.match == {"vox": ["doomsday"], "scene": ["doomsday"]}
+    watch = _movie_watch(tmp_path, movie={"vox": []}, match={"scene": ["doomsday"]},
+                         cinemas=["district-5"])
+    assert watch.match == {"scene": ["doomsday"]}
+
+
+@pytest.mark.parametrize("keywords,matched", [(["DOOMSDAY"], True),
+    (["avengers doomsday"], True), (["avengers-doomsday"], True), (["doomsday", "re_release"], True),
+    (["avengers", "missing"], False)])
+def test_run_movie_match_scene_listed_once_per_cinema(tmp_path, keywords, matched):
+    watch = _movie_watch(tmp_path, movie={"scene": []}, match={"scene": keywords})
+    pages = {}
+    for host in ("district5", "cfc"):
+        pages[f"https://{host}.scenecinemas.com/"] = f"scene_home_{host}_doomsday.html"
+        pages[f"https://{host}.scenecinemas.com/movie-details/avengers_doomsday.html"] = "scene_no_showtimes.html"
+    initial = {"notified_for": {}}
+    alerts, proposed, failures = run_watch(watch, _fixture_fetch(pages), initial, SCENE_MOVIE_NOW)
+    assert not failures
+    assert len(alerts) == (2 if matched else 0)
+    if matched:
+        assert all("just listed" in a.texts["telegram"] for a in alerts)
+        assert "Book Now" not in alerts[0].texts["telegram"]
+        assert "District 5" in alerts[0].texts["telegram"]
+        assert "Cairo Festival City" in alerts[1].texts["telegram"]
+        assert "movie-details/avengers_doomsday.html" in alerts[0].texts["discord"]
+        assert proposed["movie_listed"][watch.id] == [
+            "scene:district-5:avengers_doomsday", "scene:cairo-festival-city:avengers_doomsday"]
+        assert run_watch(watch, _fixture_fetch(pages), proposed, SCENE_MOVIE_NOW) == ([], proposed, ())
+    assert initial == {"notified_for": {}}
+
+
+def _listing_pages_vox():
+    return {"https://egy.voxcinemas.com/movies/whatson": "vox_whatson.html",
+            "https://egy.voxcinemas.com/movies/comingsoon": "vox_comingsoon.html",
+            "https://egy.voxcinemas.com/showtimes": "vox_movie.html"}
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_run_movie_match_vox_merges_slugs_and_evaluates_new_showtimes(tmp_path, explicit):
+    slugs = ["avengers-doomsday", "avengers-doomsday-infinity-vision"]
+    watch = _movie_watch(tmp_path, movie={"vox": slugs if explicit else []},
+                         match={"vox": ["doomsday"]}, cinemas=["city-centre-almaza"], mention=["123"])
+    pages = {**_listing_pages_vox(), **_movie_pages(),
+             "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday": "vox_no_showtimes.html"}
+    calls = []
+    fetch_fixture = _fixture_fetch(pages)
+    def fetch(url, headers):
+        calls.append(url)
+        return fetch_fixture(url, headers)
+    initial = {"notified_for": {}}
+    alerts, proposed, failures = run_watch(watch, fetch, initial, MOVIE_NOW)
+    assert not failures
+    assert len(alerts) == (1 if explicit else 3)
+    assert "New Showtimes" in alerts[-1].texts["telegram"]
+    assert "City Centre Alexandria" not in alerts[-1].texts["telegram"]
+    assert len(calls) == len(set(calls))
+    if not explicit:
+        assert proposed["movie_listed"][watch.id] == ["vox:site:avengers-doomsday-infinity-vision", "vox:site:avengers-doomsday"]
+        assert all("just listed at VOX" in alert.texts["telegram"] for alert in alerts[:-1])
+        assert alerts[0].texts["discord"].startswith("<@123>\n")
+        assert "](https://egy.voxcinemas.com/movies/avengers-doomsday)" in alerts[1].texts["discord"]
+    else:
+        assert "movie_listed" not in proposed
+    assert run_watch(watch, fetch, proposed, MOVIE_NOW) == ([], proposed, ())
+    assert initial == {"notified_for": {}}
+
+
+@pytest.mark.parametrize("match", [[], {}, "doomsday", [""], ["  "], [1],
+    {"scene": []}, {"scene": "doomsday"}, {"unknown": ["doomsday"]}])
+def test_movie_match_rejects_invalid_keywords(tmp_path, match):
+    with pytest.raises(RuntimeError, match="match|unknown Site"):
+        _movie_watch(tmp_path, match=match)
+
+
+def test_run_movie_match_evaluates_scene_like_explicit_slugs(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"scene": []}, match={"scene": ["resident", "evil"]},
+                         cinemas=["district-5"])
+    pages = {**_scene_movie_pages(),
+             "https://district5.scenecinemas.com/": "scene_home_district5.html"}
+    alerts, state, failures = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, SCENE_MOVIE_NOW)
+    assert not failures
+    assert len(alerts) == 2
+    assert "just listed" in alerts[0].texts["telegram"]
+    assert "3 New Showtimes" in alerts[1].texts["telegram"]
+    assert all(key.startswith("scene:district-5:") for key in state["movie_alerted"][watch.id])
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_run_movie_match_listing_cache_and_pacing_across_watches(tmp_path, caplog, failed):
+    from check_showtimes import PacedFetch
+    watch = _movie_watch(tmp_path, movie={"scene": []}, match={"scene": ["doomsday"]})
+    pages = {f"https://{host}.scenecinemas.com/": f"scene_home_{host}.html"
+             for host in ("district5", "cfc")}
+    events = []
+    def fetch(url, headers):
+        assert headers["Sec-Fetch-Dest"] == "document"
+        assert "X-Requested-With" not in headers
+        events.append(url)
+        if failed and "district5" in url:
+            raise RuntimeError("listing failed")
+        return _fixture_fetch(pages)(url, headers)
+    paced = PacedFetch(fetch, lambda seconds: events.append(seconds))
+    for wid in ("first", "second"):
+        other = _movie_watch(tmp_path, id=wid, movie=watch.movie, match=watch.match)
+        alerts, state, failures = run_watch(other, paced, {"notified_for": {}}, SCENE_MOVIE_NOW)
+        assert (alerts, state) == ([], {"notified_for": {}})
+        assert bool(failures) is failed
+    assert events == ["https://district5.scenecinemas.com/", 1, "https://cfc.scenecinemas.com/"]
+    assert ("listing failed" in caplog.text) is failed
+
+
+@pytest.mark.parametrize("fail_delivery", [None, 0, 1])
+@pytest.mark.parametrize("fail_listing", [False, True])
+def test_main_movie_match_state_only_after_delivery_and_listing_failure_exit(tmp_path, monkeypatch, fail_delivery, fail_listing):
+    import check_showtimes as notifier
+    path = _write_watches(tmp_path, [{"id": "listed", "movie": {"scene": []},
+        "match": {"scene": ["doomsday"]}, "cinemas": "all", "channels": ["telegram"]}])
+    state_path = tmp_path / "state.json"
+    initial = {"notified_for": {"date-watch": "20260731"},
+               "movie_alerted": {"old": {"identity": "20261216"}}}
+    state_path.write_text(json.dumps(initial), encoding="utf-8")
+    monkeypatch.setenv("WATCHES_FILE", str(path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
+    monkeypatch.setattr(notifier, "DEFAULT_STATE_PATH", state_path)
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return SCENE_MOVIE_NOW.astimezone(tz)
+    monkeypatch.setattr(notifier, "datetime", FrozenDatetime)
+    monkeypatch.setattr(notifier.time, "sleep", lambda _: None)
+    pages = {}
+    for host in ("district5", "cfc"):
+        if not (host == "district5" and fail_listing):
+            pages[f"https://{host}.scenecinemas.com/"] = f"scene_home_{host}_doomsday.html"
+        pages[f"https://{host}.scenecinemas.com/movie-details/avengers_doomsday.html"] = "scene_no_showtimes.html"
+    monkeypatch.setattr(notifier, "fetch_page", _fixture_fetch(pages))
+    delivered = []
+    def send(*args):
+        if fail_delivery is not None and len(delivered) == fail_delivery:
+            raise RuntimeError("delivery failed")
+        delivered.append(args[-1])
+    monkeypatch.setattr(notifier, "send_telegram", send)
+    delivery_failed = fail_delivery is not None and fail_delivery < (1 if fail_listing else 2)
+    assert notifier.main() == int(fail_listing or delivery_failed)
+    saved = load_state(state_path)
+    if delivery_failed:
+        assert saved == initial
+    else:
+        assert len(delivered) == (1 if fail_listing else 2)
+        assert len(saved["movie_listed"]["listed"]) == len(delivered)
+        assert saved["movie_alerted"] == initial["movie_alerted"]
+        assert saved["notified_for"] == initial["notified_for"]
+
+
+def test_sample_movie_match_only_alert(tmp_path):
+    from send_test_message import sample_movie_alert
+    watch = _movie_watch(tmp_path, movie={"scene": []}, match={"scene": ["doomsday"]})
+    alert = sample_movie_alert(watch, date(2026, 10, 28))
+    assert "Doomsday" in alert.texts["telegram"]
+
+
+def test_run_movie_match_vox_showtimes_filter_is_a_listing_source(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"vox": []}, match={"vox": ["doomsday", "infinity"]})
+    pages = {**_movie_pages(), **_listing_pages_vox()}
+    pages["https://egy.voxcinemas.com/movies/whatson"] = "vox_no_showtimes.html"
+    pages["https://egy.voxcinemas.com/movies/comingsoon"] = "vox_no_showtimes.html"
+    alerts, state, failures = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, MOVIE_NOW)
+    assert not failures
+    assert len(alerts) == 2
+    assert state["movie_listed"][watch.id] == ["vox:site:avengers-doomsday-infinity-vision"]
+    assert "82 New Showtimes" in alerts[-1].texts["telegram"]

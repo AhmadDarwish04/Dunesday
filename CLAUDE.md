@@ -98,6 +98,18 @@ Load-bearing details that aren't obvious from the code:
   are recorded only after delivery. The workflow commits state after changes. That's the dedupe mechanism. `load_state` migrates the legacy
   flat-string form onto the first watch. A watch's `id` *is* its dedupe key — renaming an id
   re-arms that watch. Expect `main` to receive bot commits, so pull before pushing.
+- **Movie match uses listings before Showtimes.** Scene listing discovery reads each selected
+  Cinema's home page (`a[href*="/movie-details/"]`); `/next_releasing` has no raw movie links.
+  VOX reads `/movies/whatson`, `/movies/comingsoon` (`article.movie-summary[data-slug][data-title]`)
+  and `/showtimes` (`input[name=m]`). Listing requests use navigation headers, including Scene;
+  `PacedFetch` caches listing successes and failures across Watches for the run. Keep listing
+  sources and parsers on the Site adapter. Match all keywords against slug/title, ignoring case
+  and treating hyphens, underscores and whitespace equally. **The `avengers` keyword trap:** it
+  also matches `avengers-endgame-encore`; use `doomsday` to find just the Doomsday releases.
+  Config keeps `movie` as slug lists, with sibling `match` as a shared list or per-Site map.
+  Heads-up Alerts exclude explicit slugs; `movie_listed` stores `{watch_id: ["site:cinema:slug"]}`
+  (`site` in the Cinema position for VOX). Keep these identities indefinitely and commit them
+  only after delivery, alongside `movie_alerted`.
 - **Movie watch discovery and identity matter.** VOX's cinema-less movie showtimes page supplies
   the date picker; each date page lists Cinemas, filtered after parsing. VOX `data-id` is the
   Showtime identity even when Not bookable. Scene discovers dates per Cinema; its identity combines

@@ -134,6 +134,7 @@ class MovieWatch:
     until: Optional[date] = None
     channels: list[str] = field(default_factory=lambda: ["telegram", "discord"])
     mention: list[str] = field(default_factory=list)
+    match: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,14 @@ class MoviePages:
 
 
 @dataclass(frozen=True)
+class ListingPage:
+    url: str
+    cinema: str
+    name: str
+    movie_url: Callable[[str], str]
+
+
+@dataclass(frozen=True)
 class Site:
     """Per-site adapter: how to build the URL, fetch it, and read showtimes out of it."""
     build_url: Callable[[Watch, date], str]
@@ -184,6 +193,10 @@ class Site:
     discovery_date: Callable[[str], Optional[date]] = lambda html: None
     # Known Cinema slugs and their display names; one mechanism for every Site.
     cinema_names: dict[str, str] = field(default_factory=dict)
+
+    listing_sources: Callable[[str | list[str]], list[ListingPage]] = lambda cinemas: []
+    parse_listing: Callable[[str], list[tuple[str, str]]] = lambda html: []
+    listing_headers: dict = field(default_factory=dict)
 
     @property
     def default_cinema(self) -> str:
@@ -287,21 +300,33 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
             if any(key in e for key in ("site", "movie_slug", "cinema_slug", "target", "base_url", "notify_on")):
                 raise RuntimeError(f"{where}: cannot mix Date watch and Movie watch shapes")
             movie = e["movie"]
-            if not isinstance(movie, dict) or not movie:
+            if not isinstance(movie, dict):
                 raise RuntimeError(f"{where}: movie must be a per-Site slug map")
             for name, slugs in movie.items():
                 if name not in SITES:
                     raise RuntimeError(f"{where}: unknown Site {name!r}")
                 if not isinstance(slugs, list) or any(not isinstance(slug, str) or not slug.strip() for slug in slugs):
                     raise RuntimeError(f"{where}: {name} Movie slugs must be a list of non-empty strings")
-            if not any(movie.values()):
-                raise RuntimeError(f"{where}: Movie watch needs at least one Movie slug")
+            match = e.get("match", {})
+            if isinstance(match, list):
+                match = {name: match for name in SITES}
+            if not isinstance(match, dict) or ("match" in e and not match):
+                raise RuntimeError(f"{where}: match must be a non-empty keyword list or per-Site map")
+            for name, keywords in match.items():
+                if name not in SITES:
+                    raise RuntimeError(f"{where}: unknown Site {name!r} in match")
+                if (not isinstance(keywords, list) or not keywords or
+                        any(not isinstance(word, str) or not word.strip() for word in keywords)):
+                    raise RuntimeError(f"{where}: match keywords must be a non-empty list of non-empty strings")
+            if not any(movie.values()) and not match:
+                raise RuntimeError(f"{where}: Movie watch needs at least one Movie slug or match")
             cinemas = e.get("cinemas")
             if cinemas != "all" and (not isinstance(cinemas, list) or not cinemas
                                      or any(not isinstance(slug, str) for slug in cinemas)):
                 raise RuntimeError(f"{where}: cinemas must be 'all' or a non-empty list of Cinema slugs")
             if isinstance(cinemas, list):
-                known = {name: SITES[name].cinema_names for name, slugs in movie.items() if slugs}
+                known = {name: SITES[name].cinema_names for name in dict.fromkeys([*movie, *match])
+                         if movie.get(name) or match.get(name)}
                 for slug in cinemas:
                     if not any(slug in names for names in known.values()):
                         valid = "; ".join(f"{name}: {', '.join(names)}" for name, names in known.items())
@@ -315,9 +340,9 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
                     raise RuntimeError(f"{where}: until must be YYYY-MM-DD, got {e['until']!r}") from exc
             channels, mention = parse_channels_and_mentions(e, where)
             watches.append(MovieWatch(id=wid, movie=movie, timezone=tz, cinemas=cinemas, until=until,
-                                      channels=channels, mention=mention))
+                                      channels=channels, mention=mention, match=match))
             continue
-        if "cinemas" in e or "until" in e:
+        if "cinemas" in e or "until" in e or "match" in e:
             raise RuntimeError(f"{where}: cannot mix Date watch and Movie watch shapes")
 
         site = str(e.get("site") or "").strip().lower()
@@ -646,6 +671,43 @@ def vox_movie_sources(slug: str, cinemas: str | list[str]) -> list[MoviePages]:
     return [MoviePages(build_url=partial(vox_movie_url, slug), parse=parse_movie_showtimes_vox)]
 
 
+def scene_listing_sources(cinemas: str | list[str]) -> list[ListingPage]:
+    return [ListingPage(urljoin(details.url, "/"), cinema, details.name,
+                        partial(scene_movie_url, cinema=cinema))
+            for cinema, details in SCENE_CINEMAS.items() if cinemas == "all" or cinema in cinemas]
+
+
+def parse_listing_scene(html: str) -> list[tuple[str, str]]:
+    movies = {}
+    for link in BeautifulSoup(html, "html.parser").select('a[href*="/movie-details/"]'):
+        match = re.search(r"/movie-details/([^/?]+)\.html", link.get("href", ""))
+        if match:
+            slug = match[1]
+            image = link.find("img", alt=True)
+            title = (link.get("title", "").strip() or (image["alt"].strip() if image else "")
+                     or link.get_text(" ", strip=True) or slug)
+            movies[slug] = title
+    return list(movies.items())
+
+
+def vox_listing_sources(cinemas: str | list[str]) -> list[ListingPage]:
+    return [ListingPage("https://egy.voxcinemas.com" + path, "", "VOX",
+                        lambda slug: "https://egy.voxcinemas.com/movies/" + slug)
+            for path in ("/movies/whatson", "/movies/comingsoon", "/showtimes")]
+
+
+def parse_listing_vox(html: str) -> list[tuple[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    movies = {node["data-slug"]: node["data-title"]
+              for node in soup.select("article.movie-summary[data-slug][data-title]")}
+    for node in soup.select('input[name="m"][value]'):
+        slug = node["value"].strip()
+        if slug:
+            label = soup.find("label", attrs={"for": node.get("id", "")})
+            movies.setdefault(slug, label.get_text(" ", strip=True) if label else slug)
+    return list(movies.items())
+
+
 SITES: "dict[str, Site]" = {
     "scene": Site(
         build_url=scene_url,
@@ -656,6 +718,9 @@ SITES: "dict[str, Site]" = {
         soldout_label="sold out",
         default_cinema_slug="district-5",
         cinemas=SCENE_CINEMAS,
+        listing_headers=VOX_HEADERS,
+        listing_sources=scene_listing_sources,
+        parse_listing=parse_listing_scene,
         movie_sources=scene_movie_sources,
         movie_dates=scene_movie_dates,
         discovery_empty_is_expected=lambda html: not html.strip() or "no showtimes" in html.lower(),
@@ -672,6 +737,9 @@ SITES: "dict[str, Site]" = {
         # times routinely flip from unavailable to bookable — so don't claim "sold out".
         soldout_label="not bookable",
         require_cinema=True,
+        listing_headers=VOX_HEADERS,
+        listing_sources=vox_listing_sources,
+        parse_listing=parse_listing_vox,
         movie_sources=vox_movie_sources,
         movie_dates=vox_movie_dates,
         discovery_date=vox_discovery_date,
@@ -874,6 +942,7 @@ def load_state(path: Path, watches: "Optional[list[Watch | MovieWatch]]" = None)
     """Read Date watch dedupe keys and optional Movie watch alerted identities.
 
     `movie_alerted` maps Watch id to {Showtime identity: "YYYYMMDD"}.
+    `movie_listed` maps Watch id to persistent Listed identities (Site: Cinema-or-site: slug).
 
     Older runs stored a single bare string for the one watch that existed then; that value
     is migrated onto the first watch so an already-sent notification isn't repeated.
@@ -882,7 +951,7 @@ def load_state(path: Path, watches: "Optional[list[Watch | MovieWatch]]" = None)
         return {"notified_for": {}}
 
     state = json.loads(path.read_text(encoding="utf-8"))
-    movie_state = {"movie_alerted": state["movie_alerted"]} if "movie_alerted" in state else {}
+    movie_state = {key: state[key] for key in ("movie_alerted", "movie_listed") if key in state}
     notified = state.get("notified_for")
     if isinstance(notified, dict):
         return {**movie_state, "notified_for": notified}
@@ -970,12 +1039,69 @@ class PacedFetch:
         self.fetch = fetch
         self.sleep = sleep
         self.fetched = False
+        self.listings = {}
 
     def __call__(self, url, headers):
         if self.fetched and self.sleep is not None:
             self.sleep(1)
         self.fetched = True
         return self.fetch(url, headers)
+
+    def listing(self, url, headers):
+        if url not in self.listings:
+            try:
+                self.listings[url] = self(url, headers)
+            except Exception as exc:
+                self.listings[url] = exc
+        result = self.listings[url]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def matches_movie(slug: str, title: str, keywords: list[str]) -> bool:
+    def normalise(text):
+        return re.sub(r"[-_\s]+", " ", text.casefold()).strip()
+    return all(any(normalise(word) in normalise(value) for value in (slug, title))
+               for word in keywords)
+
+
+def listed_alert(watch: MovieWatch, title: str, cinema: str, url: str) -> Alert:
+    texts = {name: adapter.mention_prefix(watch.mention) +
+             f"\U0001f440 {adapter.bold(title)} just listed at {adapter.escape(cinema)}\n" +
+             adapter.link(Showtime(time="Movie page", href=url))
+             for name in watch.channels for adapter in [CHANNELS[name]]}
+    return Alert(texts, list(watch.mention))
+
+
+def matched_movies(watch: MovieWatch, name: str, site: Site, fetch, listed: list,
+                   alerts: list, failures: list) -> dict[str, str | list[str]]:
+    selected = {slug: watch.cinemas for slug in watch.movie.get(name, [])}
+    if name not in watch.match:
+        return selected
+    for page in site.listing_sources(watch.cinemas):
+        try:
+            entries = site.parse_listing(fetch.listing(page.url, site.listing_headers))
+        except Exception as exc:
+            log.error("[%s] failed %s: %s", watch.id, page.url, exc)
+            failures.append(f"{page.url}: {exc}")
+            continue
+        for slug, title in entries:
+            if not matches_movie(slug, title, watch.match[name]):
+                continue
+            if slug in watch.movie.get(name, []):
+                continue
+            if not page.cinema:
+                selected[slug] = watch.cinemas
+            else:
+                cinemas = selected.setdefault(slug, [])
+                if page.cinema not in cinemas:
+                    cinemas.append(page.cinema)
+            identity = f"{name}:{page.cinema or 'site'}:{slug}"
+            if identity not in listed:
+                alerts.append(listed_alert(watch, title, page.name, page.movie_url(slug)))
+                listed.append(identity)
+    return selected
 
 
 def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state: dict,
@@ -987,12 +1113,15 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
     groups = {}
     movie = ""
     failures = []
-    for name, slugs in watch.movie.items():
+    alerts = []
+    listed = list(state.get("movie_listed", {}).get(watch.id, []))
+    for name in dict.fromkeys([*watch.movie, *watch.match]):
         site = SITES[name]
         if watch.cinemas != "all" and not any(c in site.cinema_names for c in watch.cinemas):
             continue
-        for slug in slugs:
-            for source in site.movie_sources(slug, watch.cinemas):
+        selected = matched_movies(watch, name, site, fetch, listed, alerts, failures)
+        for slug, cinemas in selected.items():
+            for source in site.movie_sources(slug, cinemas):
                 url = source.build_url(None)
                 try:
                     discovery, targets = discover_dates(watch, site, source, fetch)
@@ -1014,14 +1143,17 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
                     except Exception as exc:
                         log.error("[%s] failed %s: %s", watch.id, date_url, exc)
                         failures.append(f"{date_url}: {exc}")
+    proposed = state
+    if listed != state.get("movie_listed", {}).get(watch.id, []):
+        proposed = {**state, "movie_listed": {**state.get("movie_listed", {}), watch.id: listed}}
     if not groups:
-        return WatchResult([], state, tuple(failures))
+        return WatchResult(alerts, proposed, tuple(failures))
     count = sum(len(times) for dates in groups.values()
                 for experiences in dates.values() for times in experiences.values())
     texts = {channel: CHANNELS[channel].mention_prefix(watch.mention) +
              format_movie_message(channel, movie, groups, count) for channel in watch.channels}
-    proposed = {**state, "movie_alerted": {**state.get("movie_alerted", {}), watch.id: alerted}}
-    return WatchResult([Alert(texts=texts, mentions=list(watch.mention))], proposed, tuple(failures))
+    proposed = {**proposed, "movie_alerted": {**state.get("movie_alerted", {}), watch.id: alerted}}
+    return WatchResult(alerts + [Alert(texts=texts, mentions=list(watch.mention))], proposed, tuple(failures))
 
 
 def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], state: dict,
