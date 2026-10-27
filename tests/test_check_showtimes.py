@@ -523,3 +523,185 @@ def test_run_published_date_watch_uses_watch_timezone_and_not_bookable_showtimes
     assert "(not bookable)" in alerts[0].texts["telegram"]
     assert next_state == {"notified_for": {"w": "20260731"}}
     assert state == {"notified_for": {}}
+
+# ---------------------------------------------------------------------- Movie watches
+
+MOVIE_URL = "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday-infinity-vision"
+MOVIE_NOW = datetime(2026, 10, 28, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+
+
+def _movie_pages(first="vox_movie.html", slug="avengers-doomsday-infinity-vision"):
+    url = f"https://egy.voxcinemas.com/showtimes?m={slug}"
+    return {url: first, **{
+        f"{url}&d=202612{day}": (
+            first if day == 16 else "vox_movie_second_date.html" if day == 17
+            else f"vox_movie_202612{day}.html") for day in range(16, 24)
+    }}
+
+
+def _movie_watch(tmp_path, **extra):
+    entry = {"id": "avengers", "movie": {"vox": ["avengers-doomsday-infinity-vision"]},
+             "cinemas": "all", **extra}
+    return load_watches(_write_watches(tmp_path, [entry]))[0]
+
+
+def test_run_movie_watch_first_run_alerts_across_all_dates_and_cinemas(tmp_path):
+    watch = _movie_watch(tmp_path)
+    state = {"notified_for": {"date-watch": "20260731"}}
+    alerts, proposed = run_watch(watch, _fixture_fetch(_movie_pages()), state, MOVIE_NOW,
+                                 sleep=lambda seconds: None)
+    assert len(alerts) == 1
+    assert alerts[0].mentions == [] and set(alerts[0].texts) == {"telegram"}
+    text = alerts[0].texts["telegram"]
+    assert "is now bookable" in text and "82 New Showtimes" in text
+    assert text.index("City Centre Alexandria") < text.index("City Centre Almaza") < text.index("Mall of Egypt")
+    assert "Wednesday, December 16, 2026" in text and "Wednesday, December 23, 2026" in text
+    assert '<b>MAX</b>' in text and '<b>Standard</b>' in text
+    assert '<a href="https://egy.voxcinemas.com/booking/0032-169550">11:00am</a>' in text
+    assert '0047-276798' not in text
+    assert proposed["movie_alerted"]["avengers"]["0032-169550"] == "20261216"
+    assert len(proposed["movie_alerted"]["avengers"]) == 82
+    assert proposed["notified_for"] == state["notified_for"]
+    assert state == {"notified_for": {"date-watch": "20260731"}}
+
+
+def test_movie_watch_state_round_trip_preserves_date_watches(tmp_path):
+    from check_showtimes import save_state
+    state = {"notified_for": {"date-watch": "20260731"},
+             "movie_alerted": {"avengers": {"0032-169550": "20261216"}}}
+    path = tmp_path / "state.json"
+    save_state(path, state)
+    assert load_state(path, []) == state
+
+
+def test_run_movie_watch_alerts_once_when_not_bookable_becomes_bookable(tmp_path):
+    watch = _movie_watch(tmp_path)
+    state = {"notified_for": {}}
+    _, state = run_watch(watch, _fixture_fetch(_movie_pages()), state, MOVIE_NOW, sleep=lambda _: None)
+    alerts, state = run_watch(watch, _fixture_fetch(_movie_pages("vox_movie_now_bookable.html")),
+                              state, MOVIE_NOW, sleep=lambda _: None)
+    assert len(alerts) == 1 and "1 New Showtimes" in alerts[0].texts["telegram"]
+    assert 'booking/0047-276798' in alerts[0].texts["telegram"]
+    assert len(state["movie_alerted"]["avengers"]) == 83
+    assert run_watch(watch, _fixture_fetch(_movie_pages()), state, MOVIE_NOW, sleep=lambda _: None) == ([], state)
+    assert run_watch(watch, _fixture_fetch(_movie_pages("vox_movie_now_bookable.html")),
+                     state, MOVIE_NOW, sleep=lambda _: None) == ([], state)
+
+
+def test_run_movie_watch_keeps_other_slugs_and_dates_after_failures(tmp_path, caplog):
+    from check_showtimes import MovieWatchFailure
+    watch = _movie_watch(tmp_path, movie={"vox": ["broken", "avengers-doomsday-infinity-vision"]})
+    pages = _movie_pages()
+    del pages[f"{MOVIE_URL}&d=20261217"]
+    state = {"notified_for": {}}
+    with pytest.raises(MovieWatchFailure) as caught:
+        run_watch(watch, _fixture_fetch(pages), state, MOVIE_NOW, sleep=lambda _: None)
+    alerts, proposed = caught.value.result
+    assert len(alerts) == 1 and "73 New Showtimes" in alerts[0].texts["telegram"]
+    assert len(proposed["movie_alerted"]["avengers"]) == 73
+    assert "0032-169554" not in proposed["movie_alerted"]["avengers"]
+    assert "broken" in caplog.text and "20261217" in caplog.text
+    assert state == {"notified_for": {}}
+
+
+@pytest.mark.parametrize("fixture,warning", [
+    ("vox_no_showtimes.html", False), ("vox_missing_empty_marker.html", True),
+])
+def test_run_movie_watch_empty_page_warns_only_without_marker(tmp_path, caplog, fixture, warning):
+    watch = _movie_watch(tmp_path)
+    state = {"notified_for": {}}
+    assert run_watch(watch, _fixture_fetch({MOVIE_URL: fixture}), state, MOVIE_NOW,
+                     sleep=lambda _: None) == ([], state)
+    assert ("no showtimes AND no expected empty-state marker" in caplog.text) is warning
+
+
+@pytest.mark.parametrize("fail_after", [None, 0, 1])
+def test_main_movie_watch_partial_failure_commits_only_delivered_alerts(tmp_path, monkeypatch, fail_after):
+    import check_showtimes as notifier
+    watches_path = _write_watches(tmp_path, [{"id": "avengers", "movie": {
+        "vox": ["broken", "avengers-doomsday-infinity-vision"]}, "cinemas": "all"}])
+    state = {"notified_for": {"date-watch": "20260731"}}
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setenv("WATCHES_FILE", str(watches_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test-chat")
+    monkeypatch.setattr(notifier, "DEFAULT_STATE_PATH", state_path)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return MOVIE_NOW.astimezone(tz)
+
+    monkeypatch.setattr(notifier, "datetime", FrozenDatetime)
+    monkeypatch.setattr(notifier.time, "sleep", lambda _: None)
+    monkeypatch.setattr(notifier, "fetch_page", _fixture_fetch(_movie_pages()))
+    delivered = []
+
+    def send(token, chat_id, text):
+        if fail_after is not None and len(delivered) == fail_after:
+            raise RuntimeError("Channel failed")
+        delivered.append(text)
+
+    monkeypatch.setattr(notifier, "send_telegram", send)
+    assert notifier.main() == 1
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["notified_for"] == state["notified_for"]
+    if fail_after is not None:
+        assert saved == state
+    else:
+        assert len(delivered) > 1
+        assert all(len(text) <= 4096 for text in delivered)
+        assert "82 New Showtimes" in delivered[0]
+        assert len(saved["movie_alerted"]["avengers"]) == 82
+
+
+@pytest.mark.parametrize("extra,message", [
+    ({"target": {"date": "2026-12-16"}}, "cannot mix"),
+    ({"site": "vox"}, "cannot mix"),
+    ({"movie_slug": "avengers"}, "cannot mix"),
+    ({"cinema_slug": "mall-of-egypt"}, "cannot mix"),
+    ({"notify_on": "published"}, "cannot mix"),
+    ({"movie": {"vox": [], "scene": []}}, "at least one Movie slug"),
+    ({"movie": {"unknown": ["avengers"]}}, "unknown Site"),
+    ({"movie": {"scene": ["avengers"]}}, "not yet supported"),
+    ({"movie": {"vox": "avengers"}}, "list of non-empty strings"),
+    ({"movie": {"vox": [""]}}, "list of non-empty strings"),
+    ({"cinemas": ["mall-of-egypt"]}, "requires cinemas"),
+    ({"timezone": "Unknown/Timezone"}, "unknown timezone"),
+])
+def test_movie_watch_rejects_bad_config(tmp_path, extra, message):
+    with pytest.raises(RuntimeError, match=message):
+        _movie_watch(tmp_path, **extra)
+
+
+def test_run_movie_watch_combines_multiple_slugs_in_one_alert(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"vox": ["avengers-doomsday-infinity-vision", "avengers-doomsday"], "scene": []})
+    pages = {**_movie_pages(), **_movie_pages("vox_movie_now_bookable.html", "avengers-doomsday")}
+    alerts, state = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, MOVIE_NOW, sleep=lambda _: None)
+    assert len(alerts) == 1 and "83 New Showtimes" in alerts[0].texts["telegram"]
+    assert len(state["movie_alerted"]["avengers"]) == 83
+
+
+def test_run_movie_watch_ignores_past_dates(tmp_path):
+    watch = _movie_watch(tmp_path)
+    state = {"notified_for": {}}
+    now = datetime(2026, 12, 24, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    assert run_watch(watch, _fixture_fetch({MOVIE_URL: "vox_movie.html"}), state, now,
+                     sleep=lambda _: None) == ([], state)
+
+
+
+def test_run_movie_watch_with_only_not_bookable_showtimes_is_quiet(tmp_path):
+    watch = _movie_watch(tmp_path)
+    pages = _movie_pages("vox_movie_not_bookable.html")
+    pages.update({f"{MOVIE_URL}&d=202612{day}": "vox_no_showtimes.html" for day in range(17, 24)})
+    state = {"notified_for": {"date-watch": "20260731"}}
+    assert run_watch(watch, _fixture_fetch(pages), state, MOVIE_NOW,
+                     sleep=lambda _: None) == ([], state)
+
+
+def test_vox_movie_date_picker_includes_bare_current_date_and_every_link():
+    from check_showtimes import vox_movie_dates
+    assert vox_movie_dates(_read("vox_movie.html")) == [date(2026, 12, day) for day in range(16, 24)]
+    assert vox_movie_dates(_read("vox_movie_second_date.html")) == [date(2026, 12, day) for day in range(16, 24)]
