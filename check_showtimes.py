@@ -120,11 +120,12 @@ class Watch:
 
 @dataclass(frozen=True)
 class MovieWatch:
-    """A movie across Cinemas and every Published date on its Sites."""
+    """A movie across selected Cinemas and every Published date on its Sites."""
     id: str
     movie: dict[str, list[str]]
     timezone: str
     cinemas: str | list[str] = "all"
+    until: Optional[date] = None
     channels: list[str] = field(default_factory=lambda: ["telegram", "discord"])
     mention: list[str] = field(default_factory=list)
 
@@ -169,7 +170,14 @@ class Site:
     movie_title: Optional[Callable[[str, str], str]] = None
     # Scene discovers dates per Cinema; VOX discovers all Cinemas on one page.
     movie_cinemas: tuple[str, ...] = ("",)
+    # Known Cinema slugs and their display names; one mechanism for every Site.
     cinema_names: dict[str, str] = field(default_factory=dict)
+
+    def cinema_slug(self, name: str) -> Optional[str]:
+        """Resolve a parsed Cinema name to one of this Site's known slugs."""
+        normalised = re.sub(r"[\W_]+", "", name.casefold())
+        return next((slug for slug, display in self.cinema_names.items()
+                     if re.sub(r"[\W_]+", "", display.casefold()) == normalised), None)
 
 
 def load_config(watches: list[Watch], env: Mapping[str, str]) -> Config:
@@ -248,23 +256,31 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
             if not any(movie.values()):
                 raise RuntimeError(f"{where}: Movie watch needs at least one Movie slug")
             cinemas = e.get("cinemas")
-            if cinemas != "all":
-                if not isinstance(cinemas, list) or not cinemas or any(not isinstance(c, str) for c in cinemas):
-                    raise RuntimeError(f"{where}: cinemas must be 'all' or a non-empty Cinema slug list")
-                known = {slug for site in SITES.values() for slug in site.cinema_names}
-                for cinema in cinemas:
-                    if cinema not in known:
-                        raise RuntimeError(f"{where}: unknown Cinema {cinema!r}")
+            if cinemas != "all" and (not isinstance(cinemas, list) or not cinemas
+                                     or any(not isinstance(slug, str) for slug in cinemas)):
+                raise RuntimeError(f"{where}: cinemas must be 'all' or a non-empty list of Cinema slugs")
+            if isinstance(cinemas, list):
+                known = {name: SITES[name].cinema_names for name, slugs in movie.items() if slugs}
+                for slug in cinemas:
+                    if not any(slug in names for names in known.values()):
+                        valid = "; ".join(f"{name}: {', '.join(names)}" for name, names in known.items())
+                        raise RuntimeError(f"{where}: unknown Cinema slug {slug!r}; valid slugs by Site: {valid}")
             tz = str(e.get("timezone") or "").strip() or default_timezone
             try:
                 ZoneInfo(tz)
             except Exception as exc:
                 raise RuntimeError(f"{where}: unknown timezone {tz!r}") from exc
+            until = None
+            if "until" in e:
+                try:
+                    until = date.fromisoformat(e["until"].strip())
+                except (ValueError, AttributeError) as exc:
+                    raise RuntimeError(f"{where}: until must be YYYY-MM-DD, got {e['until']!r}") from exc
             channels, mention = parse_channels_and_mentions(e, where)
-            watches.append(MovieWatch(id=wid, movie=movie, timezone=tz, cinemas=cinemas,
+            watches.append(MovieWatch(id=wid, movie=movie, timezone=tz, cinemas=cinemas, until=until,
                                       channels=channels, mention=mention))
             continue
-        if "cinemas" in e:
+        if "cinemas" in e or "until" in e:
             raise RuntimeError(f"{where}: cannot mix Date watch and Movie watch shapes")
 
         site = str(e.get("site") or "").strip().lower()
@@ -633,9 +649,11 @@ SITES: "dict[str, Site]" = {
         movie_dates=vox_movie_dates,
         movie_parse=parse_movie_showtimes_vox,
         movie_title=vox_movie_title,
-        cinema_names={"city-centre-alexandria": "City Centre Alexandria",
-                      "city-centre-almaza": "City Centre Almaza",
-                      "mall-of-egypt": "Mall of Egypt"},
+        cinema_names={
+            "city-centre-alexandria": "City Centre Alexandria",
+            "city-centre-almaza": "City Centre Almaza",
+            "mall-of-egypt": "Mall of Egypt",
+        },
     ),
 }
 
@@ -877,9 +895,7 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
         if not slugs:
             continue
         site = SITES[name]
-        selected = None if watch.cinemas == "all" else {
-            display for slug, display in site.cinema_names.items() if slug in watch.cinemas}
-        if selected == set():
+        if watch.cinemas != "all" and not any(c in site.cinema_names for c in watch.cinemas):
             continue
         for slug in slugs:
             for cinema in site.movie_cinemas:
@@ -906,7 +922,7 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
                         html = page(date_url, site)
                         showtimes = site.movie_parse(html, target, cinema)
                         for st in showtimes:
-                            if selected is not None and st.cinema not in selected:
+                            if watch.cinemas != "all" and site.cinema_slug(st.cinema) not in watch.cinemas:
                                 continue
                             if st.soldout or st.identity in alerted:
                                 continue
@@ -950,6 +966,16 @@ def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], stat
         raise ValueError("now must be an aware datetime")
     now = now.astimezone(ZoneInfo(watch.timezone))
     if isinstance(watch, MovieWatch):
+        # Prune only this Watch: each Movie watch has its own timezone. Cleanup can
+        # be saved without an Alert; new identities still require successful delivery.
+        previous = state.get("movie_alerted", {}).get(watch.id, {})
+        today = now.strftime("%Y%m%d")
+        retained = {identity: target for identity, target in previous.items() if target >= today}
+        if retained != previous:
+            state = {**state, "movie_alerted": {**state["movie_alerted"], watch.id: retained}}
+        if watch.until is not None and now.date() > watch.until:
+            log.info("[%s] until date %s has passed - skipping", watch.id, watch.until.isoformat())
+            return [], state
         return run_movie_watch(watch, fetch, state, now, sleep)
     site = SITES[watch.site]
     target = resolve_target_date(watch, now=now)
