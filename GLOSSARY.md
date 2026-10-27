@@ -16,6 +16,14 @@ _Avoid_: Branch, theater, venue, location
 A Site's own identifier for a movie. One film may have several slugs on one Site (e.g. a standard and an "Infinity Vision" release), and slugs differ between Sites.
 _Avoid_: Movie ID, film code
 
+**Listed**:
+A movie is listed on a Site once it appears in that Site's movie listings (now showing or coming soon), which can happen before any of its Showtimes are Published.
+_Avoid_: Announced, added
+
+**Movie match**:
+Keywords a Movie watch uses to find a movie's Movie slugs on each Site by itself; a slug matches when its slug or title contains every keyword.
+_Avoid_: Search, filter
+
 **Experience**:
 The screen format a Showtime is sold under (Standard, IMAX, GOLD, 4DX, VIP).
 _Avoid_: Format, hall type
