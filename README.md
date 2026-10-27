@@ -1,8 +1,8 @@
 # Cinema Showtime Notifier
 
-Get a Telegram message the moment a movie's showtimes go live — so you can book before it sells out.
+Get a Telegram or Discord Alert the moment a movie's showtimes go live — so you can book before it sells out.
 
-Checks every 15 minutes via GitHub Actions. One message per movie per date, no repeats.
+Checks every 15 minutes via GitHub Actions. One Alert per Watch per date after successful delivery.
 
 Works with **VOX Cinemas Egypt**, **Scene Cinemas District 5**, or both at once.
 
@@ -36,6 +36,11 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | The token from Step 1 |
 | `TELEGRAM_CHAT_ID` | The ID from Step 2 |
+| `DISCORD_WEBHOOK_URL` | The webhook URL for your Discord channel (Channel Settings → Integrations → Webhooks) |
+
+Only the secrets for Channels used by your Watches are required. Watches default to both
+Telegram and Discord; set `"channels": ["telegram"]` or `"channels": ["discord"]` to use one.
+Discord-only setups can skip the Telegram steps above.
 
 Optionally, under the **Variables** tab, add `TIMEZONE` (e.g. `Africa/Cairo`). Defaults to `Africa/Cairo`.
 
@@ -156,6 +161,8 @@ https://district5.scenecinemas.com/movie-details/the-odyssey.html
 | `cinema_slug` | VOX only | From the URL (see above) |
 | `target` | ✅ | Pick **one**: `{"date": "2026-08-06"}` or `{"weekday": "friday"}` |
 | `notify_on` | optional | `published` (default) or `bookable` — see below |
+| `channels` | optional | Non-empty list of `telegram` and/or `discord`; defaults to both |
+| `mention` | optional | List of numeric Discord user ID strings, e.g. `["123456789"]`; defaults to empty |
 | `timezone` | optional | e.g. `Europe/London`. Defaults to your `TIMEZONE` variable |
 | `base_url` | advanced | Scene only — point at a different Scene branch's movie-details URL |
 
@@ -173,6 +180,10 @@ Both sites list showtimes *before* tickets go on sale, so choose when you want t
 
 Use `bookable` if your goal is to grab seats. It keeps checking until sales open.
 
+Discord Alerts mention only the listed users; role and everyone mentions are disabled.
+Long Discord Alerts split into messages of at most 2000 characters. If any Channel fails,
+the Watch retries next run, so a Channel that already succeeded may receive the Alert again.
+
 If you get something wrong (unknown site, both target types, a duplicate `id`, a bad date), the run fails immediately with a clear message rather than quietly never notifying you.
 
 ---
@@ -181,7 +192,7 @@ If you get something wrong (unknown site, both target types, a duplicate `id`, a
 
 **Actions → Test Telegram → Run workflow.**
 
-Sends one sample alert per watch, showing exactly what a real one will look like, each marked with a 🧪 TEST banner. Use this to confirm your token, chat ID, and formatting all work — no need to wait for real showtimes.
+Sends one sample Alert per Watch to its real Channels, including Discord Mentions, each marked with a 🧪 TEST banner. Use this to confirm your credentials and formatting work — no need to wait for real showtimes.
 
 To check the real thing is running: **Actions → Check Showtimes → Run workflow**, then read the log. You'll see one line per watch, e.g.:
 
@@ -209,7 +220,8 @@ To get an alert again, delete that watch's line and commit. Deleting the whole f
 pip install -r requirements.txt pytest
 pytest -q                     # run the tests
 
-# Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID first (or put them in a .env file)
+# Set the credentials for your Watches' Channels first (the sample helper also reads .env)
+# Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID; Discord: DISCORD_WEBHOOK_URL
 python check_showtimes.py     # ⚠️ really sends messages and updates state.json
 python send_test_message.py   # sample alert per watch
 ```

@@ -1,4 +1,4 @@
-"""One-shot helper: send a sample Telegram message per configured watch.
+"""One-shot helper: send a sample Alert to each Watch's configured Channels.
 
 Samples are derived from `watches.json`, so each message uses that watch's real site
 wording ("sold out" vs "not bookable") and its real `notify_on` headline — the point is to
@@ -9,6 +9,7 @@ Every message is prefixed with a TEST banner, because these land in a shared gro
 Usage (PowerShell):
     $env:TELEGRAM_BOT_TOKEN = "..."
     $env:TELEGRAM_CHAT_ID   = "..."
+    $env:DISCORD_WEBHOOK_URL = "..."
     python send_test_message.py                  # one message per watch
     python send_test_message.py odyssey-d5-friday  # only the named watch(es)
 
@@ -23,14 +24,15 @@ from datetime import date, timedelta
 
 from check_showtimes import (
     SITES,
-    DEFAULT_WATCHES_PATH,
+    Alert,
     Showtime,
     Watch,
     title_from_slug,
-    format_message,
+    build_alert,
+    load_config,
     load_watches,
     resolve_target_date,
-    send_telegram,
+    send_alert,
 )
 
 try:
@@ -78,13 +80,8 @@ def sample_date(watch: Watch) -> date:
 def main(argv: "list[str]") -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars first.", file=sys.stderr)
-        return 1
-
-    watches = load_watches(DEFAULT_WATCHES_PATH)
+    cfg = load_config([], os.environ)
+    watches = load_watches(cfg.watches_path, cfg.default_timezone)
     wanted = set(argv)
     if wanted:
         unknown = wanted - {w.id for w in watches}
@@ -93,23 +90,35 @@ def main(argv: "list[str]") -> int:
             return 1
         watches = [w for w in watches if w.id in wanted]
 
+    cfg = load_config(watches, os.environ)
+    failures = []
     for watch in watches:
         site = SITES[watch.site]
         headline = "is now bookable!" if watch.notify_on == "bookable" else "showtimes are live!"
-        text = format_message(
+        alert = build_alert(
+            watch=watch,
             movie=title_from_slug(watch.movie_slug),
             cinema=(title_from_slug(watch.cinema_slug) if watch.cinema_slug
                     else site.default_cinema or watch.site.title()),
-            target_date=sample_date(watch),
+            target=sample_date(watch),
             groups=sample_groups(watch),
             soldout_label=site.soldout_label,
             headline=headline,
         )
-        log.info("[%s] sending sample (notify_on=%s) to chat %s", watch.id, watch.notify_on, chat_id)
-        send_telegram(token, chat_id, BANNER + "\n\n" + text)
+        texts = {}
+        for channel, text in alert.texts.items():
+            banner = BANNER if channel == "telegram" else BANNER.replace("<b>", "**").replace("</b>", "**")
+            texts[channel] = banner + "\n\n" + text
+        log.info("[%s] sending sample (notify_on=%s) to %s",
+                 watch.id, watch.notify_on, ", ".join(texts))
+        try:
+            send_alert(cfg, Alert(texts=texts, mentions=alert.mentions))
+        except Exception as exc:  # noqa: BLE001 — keep trying the other Watches
+            log.error("[%s] failed: %s", watch.id, exc)
+            failures.append(watch.id)
 
-    log.info("%d test message(s) sent — check Telegram", len(watches))
-    return 0
+    log.info("%d sample Alert(s) sent — check the configured Channels", len(watches) - len(failures))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
