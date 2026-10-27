@@ -37,13 +37,18 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python check_showtimes.py
 
+      # Runs even when the check exits 1: a partly failed run still delivers Alerts
+      # for what succeeded, and skipping this step would re-send them every run.
+      # Rebase before pushing so a concurrent human or bot commit can't drop state.
       - name: Commit state.json if changed
+        if: ${{ !cancelled() }}
         run: |
           if ! git diff --quiet state.json; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state.json
             git commit -m "chore: update notified_for state"
+            git pull --rebase
             git push
           else
             echo "state.json unchanged — nothing to commit"
