@@ -1,10 +1,9 @@
 """Poll cinema Sites for Date watches and Movie watches and alert via Telegram or Discord.
 
-Watches are declared in `watches.json`; each one names a site adapter, a movie, and a
-target date (either a fixed calendar date or "the next occurrence of a weekday"). Every
-run checks all of them independently and sends one Alert per watch that has
-just gone live. Movie watches discover every Published date and Cinema, alerting on
-Bookable Showtimes whose identities the Watch has never alerted about.
+Watches are declared in `watches.json`. Date watches select a Site, movie, Cinema and
+fixed date or weekday, sending one Alert when Showtimes become Published or Bookable.
+Movie watches discover every Published date and Cinema, alerting on Bookable Showtimes
+whose identities the Watch has never alerted about.
 
 Two sites are supported, and both share the same core signal: **no showtimes parsed means
 "not published yet"**, because each site only publishes a rolling window of upcoming dates.
@@ -28,9 +27,10 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import partial
 from html import escape
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, NamedTuple, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
@@ -38,13 +38,19 @@ import requests
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
+
+@dataclass(frozen=True)
+class Cinema:
+    url: str
+    name: str
+
+
 SCENE_CINEMAS = {
-    "district-5": ("https://district5.scenecinemas.com/movie-details/{movie}.html",
+    "district-5": Cinema("https://district5.scenecinemas.com/movie-details/{movie}.html",
                    "Scene Cinemas — District 5"),
-    "cairo-festival-city": ("https://cfc.scenecinemas.com/movie-details/{movie}.html",
+    "cairo-festival-city": Cinema("https://cfc.scenecinemas.com/movie-details/{movie}.html",
                             "Scene Cinemas — Cairo Festival City"),
 }
-SCENE_CINEMA_NAME = SCENE_CINEMAS["district-5"][1]
 SCENE_SHOWTIMES_URL = "{base}?business_day={date}&ajax=1"
 VOX_SHOWTIMES_URL = "https://egy.voxcinemas.com/showtimes?c={cinema}&m={movie}&d={date}"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -139,7 +145,6 @@ class Showtime:
     identity: str = ""
     cinema: str = ""
     experience: str = ""
-    date: Optional[date] = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +152,13 @@ class Alert:
     """Text keyed by Channel name, with the mentions to include in the Alert."""
     texts: dict[str, str]
     mentions: list[str]
+
+
+@dataclass(frozen=True)
+class MoviePages:
+    """One discovery page and its date pages, possibly covering all Cinemas."""
+    build_url: Callable[[Optional[date]], str]
+    parse: Callable[[str, date], list[Showtime]]
 
 
 @dataclass(frozen=True)
@@ -162,16 +174,34 @@ class Site:
     # What a non-bookable time means on this site — Scene flags genuine sell-outs,
     # VOX uses one "unavailable" state for both sold out and not-yet-on-sale.
     soldout_label: str
-    # Cinema name to use when the watch has no cinema_slug (single-venue sites).
-    default_cinema: str = ""
-    movie_url: Optional[Callable[[str, Optional[date], str], str]] = None
+    default_cinema_slug: str = ""
+    require_cinema: bool = False
+    cinemas: dict[str, Cinema] = field(default_factory=dict)
+    movie_sources: Optional[Callable[[str, str | list[str]], list[MoviePages]]] = None
     movie_dates: Optional[Callable[[str], list[date]]] = None
-    movie_parse: Optional[Callable[[str, date, str], list[Showtime]]] = None
     movie_title: Optional[Callable[[str, str], str]] = None
-    # Scene discovers dates per Cinema; VOX discovers all Cinemas on one page.
-    movie_cinemas: tuple[str, ...] = ("",)
+    discovery_empty_is_expected: Callable[[str], bool] = lambda html: False
+    discovery_date: Callable[[str], Optional[date]] = lambda html: None
     # Known Cinema slugs and their display names; one mechanism for every Site.
     cinema_names: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def default_cinema(self) -> str:
+        return self.cinema_names.get(self.default_cinema_slug, "")
+
+    def date_watch_settings(self, cinema: str, base_url: str, movie: str,
+                            where: str, name: str) -> tuple[str, str]:
+        if self.require_cinema and not cinema:
+            raise RuntimeError(f"{where}: site {name!r} requires 'cinema_slug'")
+        selected = cinema or self.default_cinema_slug
+        if self.cinemas:
+            if selected not in self.cinemas:
+                raise RuntimeError(f"{where}: unknown {name} cinema_slug {cinema!r}; "
+                                   f"valid slugs: {', '.join(self.cinemas)}")
+            base_url = base_url or self.cinemas[selected].url
+            if "{movie}" in base_url:
+                base_url = base_url.format(movie=movie)
+        return cinema, base_url
 
     def cinema_slug(self, name: str) -> Optional[str]:
         """Resolve a parsed Cinema name to one of this Site's known slugs."""
@@ -182,22 +212,19 @@ class Site:
 
 def load_config(watches: list[Watch], env: Mapping[str, str]) -> Config:
     """Validate credentials only for Channels used by the supplied Watches."""
-    channels = {channel for watch in watches for channel in watch.channels}
-    required = []
-    if "telegram" in channels:
-        required.extend(["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"])
-    if "discord" in channels:
-        required.append("DISCORD_WEBHOOK_URL")
+    used = {channel for watch in watches for channel in watch.channels}
+    required = [key for channel in CHANNELS if channel in used
+                for key in CHANNELS[channel].credentials]
     missing = [key for key in required if not env.get(key, "").strip()]
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-    watches_path = env.get("WATCHES_FILE")
+    watches_path, timezone = watch_defaults(env)
     return Config(
         telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=env.get("TELEGRAM_CHAT_ID", ""),
-        default_timezone=(env.get("TIMEZONE") or "Africa/Cairo").strip(),
-        watches_path=Path(watches_path) if watches_path else DEFAULT_WATCHES_PATH,
+        default_timezone=timezone,
+        watches_path=watches_path,
         discord_webhook_url=env.get("DISCORD_WEBHOOK_URL", ""),
     )
 
@@ -208,7 +235,7 @@ def parse_channels_and_mentions(e: dict, where: str) -> "tuple[list[str], list[s
     if not isinstance(channels, list) or not channels:
         raise RuntimeError(f"{where}: channels must be a non-empty list")
     for channel in channels:
-        if channel not in ("telegram", "discord"):
+        if not isinstance(channel, str) or channel not in CHANNELS:
             raise RuntimeError(f"{where}: unknown channel {channel!r}; expected telegram or discord")
     if len(set(channels)) != len(channels):
         raise RuntimeError(f"{where}: duplicate channel in channels")
@@ -218,6 +245,20 @@ def parse_channels_and_mentions(e: dict, where: str) -> "tuple[list[str], list[s
     if any(not isinstance(uid, str) or not re.fullmatch(r"[0-9]+", uid) for uid in mention):
         raise RuntimeError(f"{where}: mention must contain numeric Discord user ID strings")
     return channels, mention
+
+
+def watch_timezone(entry: dict, default: str, where: str) -> str:
+    tz = str(entry.get("timezone") or "").strip() or default
+    try:
+        ZoneInfo(tz)
+    except Exception as exc:
+        raise RuntimeError(f"{where}: unknown timezone {tz!r}") from exc
+    return tz
+
+
+def watch_defaults(env: Mapping[str, str]) -> tuple[Path, str]:
+    return (Path(env.get("WATCHES_FILE") or DEFAULT_WATCHES_PATH),
+            (env.get("TIMEZONE") or "Africa/Cairo").strip())
 
 
 def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Watch | MovieWatch]":
@@ -265,11 +306,7 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
                     if not any(slug in names for names in known.values()):
                         valid = "; ".join(f"{name}: {', '.join(names)}" for name, names in known.items())
                         raise RuntimeError(f"{where}: unknown Cinema slug {slug!r}; valid slugs by Site: {valid}")
-            tz = str(e.get("timezone") or "").strip() or default_timezone
-            try:
-                ZoneInfo(tz)
-            except Exception as exc:
-                raise RuntimeError(f"{where}: unknown timezone {tz!r}") from exc
+            tz = watch_timezone(e, default_timezone, where)
             until = None
             if "until" in e:
                 try:
@@ -291,19 +328,9 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
         if not movie_slug:
             raise RuntimeError(f"{where}: missing 'movie_slug'")
 
-        cinema_slug = str(e.get("cinema_slug") or "").strip()
-        if site == "vox" and not cinema_slug:
-            raise RuntimeError(f"{where}: site 'vox' requires 'cinema_slug'")
-
-        base_url = str(e.get("base_url") or "").strip()
-        if site == "scene":
-            if cinema_slug and cinema_slug not in SCENE_CINEMAS:
-                raise RuntimeError(
-                    f"{where}: unknown Scene cinema_slug {cinema_slug!r}; "
-                    f"valid slugs: {', '.join(SCENE_CINEMAS)}")
-            base_url = base_url or SCENE_CINEMAS[cinema_slug or "district-5"][0]
-            if "{movie}" in base_url:
-                base_url = base_url.format(movie=movie_slug)
+        cinema_slug, base_url = SITES[site].date_watch_settings(
+            str(e.get("cinema_slug") or "").strip(),
+            str(e.get("base_url") or "").strip(), movie_slug, where, site)
 
         target = e.get("target") or {}
         weekday = str(target.get("weekday") or "").strip().lower()
@@ -324,26 +351,8 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
             raise RuntimeError(
                 f"{where}: notify_on must be one of {list(NOTIFY_MODES)}, got {notify_on!r}")
 
-        channels = e.get("channels", ["telegram", "discord"])
-        if not isinstance(channels, list) or not channels:
-            raise RuntimeError(f"{where}: channels must be a non-empty list")
-        for channel in channels:
-            if channel not in ("telegram", "discord"):
-                raise RuntimeError(f"{where}: unknown channel {channel!r}; expected telegram or discord")
-        if len(set(channels)) != len(channels):
-            raise RuntimeError(f"{where}: duplicate channel in channels")
-
-        mention = e.get("mention", [])
-        if not isinstance(mention, list):
-            raise RuntimeError(f"{where}: mention must be a list of Discord user ID strings")
-        if any(not isinstance(uid, str) or not re.fullmatch(r"[0-9]+", uid) for uid in mention):
-            raise RuntimeError(f"{where}: mention must contain numeric Discord user ID strings")
-
-        tz = str(e.get("timezone") or "").strip() or default_timezone
-        try:
-            ZoneInfo(tz)
-        except Exception as exc:  # noqa: BLE001 — zoneinfo raises its own error types
-            raise RuntimeError(f"{where}: unknown timezone {tz!r}") from exc
+        channels, mention = parse_channels_and_mentions(e, where)
+        tz = watch_timezone(e, default_timezone, where)
 
         watches.append(Watch(
             id=wid,
@@ -462,7 +471,7 @@ def scene_display_names(html: str, watch: Watch) -> "tuple[str, str]":
     falling back to the selected Scene Cinema's table name."""
     movie = title_from_slug(watch.movie_slug)
 
-    cinema = SCENE_CINEMAS[watch.cinema_slug or "district-5"][1]
+    cinema = SITES["scene"].cinema_names[watch.cinema_slug or SITES["scene"].default_cinema_slug]
     soup = BeautifulSoup(html, "html.parser")
     branch = soup.find(class_="branch")
     if branch and branch.get_text(strip=True):
@@ -476,8 +485,8 @@ def scene_empty_is_expected(html: str) -> bool:
     return True
 
 
-def scene_movie_url(slug: str, target: Optional[date] = None, cinema: str = "district-5") -> str:
-    base = SCENE_CINEMAS[cinema][0].format(movie=slug)
+def scene_movie_url(slug: str, target: Optional[date] = None, *, cinema: str) -> str:
+    base = SCENE_CINEMAS[cinema].url.format(movie=slug)
     return SCENE_SHOWTIMES_URL.format(base=base, date=target.strftime("%d-%m-%Y")) if target else base
 
 
@@ -492,12 +501,12 @@ def scene_movie_title(html: str, slug: str) -> str:
     return heading.get_text(" ", strip=True) if heading else title_from_slug(slug)
 
 
-def parse_movie_showtimes_scene(html: str, target: date, cinema: str) -> list[Showtime]:
+def parse_movie_showtimes_scene(html: str, target: date, *, cinema: str, movie_url: str) -> list[Showtime]:
     # Scene has no stable per-Showtime id. Movie variants share the same identity
     # when Cinema, date, time and Experience match; booking URLs may change.
-    return [Showtime(time=st.time, href="", soldout=st.soldout,
+    return [Showtime(time=st.time, href=movie_url, soldout=st.soldout,
                      identity=f"scene:{cinema}:{target:%Y%m%d}:{st.time}:{experience}",
-                     cinema=SCENE_CINEMAS[cinema][1], experience=experience, date=target)
+                     cinema=SCENE_CINEMAS[cinema].name, experience=experience)
             for experience, times in parse_showtimes_scene(html).items() for st in times]
 
 
@@ -587,7 +596,12 @@ def vox_movie_dates(html: str) -> list[date]:
     return sorted({datetime.strptime(value, "%Y%m%d").date() for value in values})
 
 
-def vox_movie_url(slug: str, target: Optional[date] = None, cinema: str = "") -> str:
+def vox_discovery_date(html: str) -> Optional[date]:
+    current = BeautifulSoup(html, "html.parser").select_one('section.showtimes input[name=d]')
+    return datetime.strptime(current["value"], "%Y%m%d").date() if current and current.get("value") else None
+
+
+def vox_movie_url(slug: str, target: Optional[date] = None) -> str:
     url = f"https://egy.voxcinemas.com/showtimes?m={slug}"
     return f"{url}&d={target:%Y%m%d}" if target else url
 
@@ -598,7 +612,7 @@ def vox_movie_title(html: str, slug: str) -> str:
     return heading.get_text(" ", strip=True) if heading else title_from_slug(slug)
 
 
-def parse_movie_showtimes_vox(html: str, target: date, cinema: str = "") -> list[Showtime]:
+def parse_movie_showtimes_vox(html: str, target: date) -> list[Showtime]:
     """Read Bookable and Not bookable Showtimes with Cinema and stable VOX identity."""
     soup = BeautifulSoup(html, "html.parser")
     showtimes = []
@@ -616,8 +630,20 @@ def parse_movie_showtimes_vox(html: str, target: date, cinema: str = "") -> list
             showtimes.append(Showtime(
                 time=node.get_text(strip=True), href=urljoin("https://egy.voxcinemas.com", href),
                 soldout=soldout, identity=identity, cinema=cinema,
-                experience=_vox_group_label(node), date=target))
+                experience=_vox_group_label(node)))
     return showtimes
+
+
+def scene_movie_sources(slug: str, cinemas: str | list[str]) -> list[MoviePages]:
+    return [MoviePages(
+        build_url=partial(scene_movie_url, slug, cinema=cinema),
+        parse=partial(parse_movie_showtimes_scene, cinema=cinema,
+                      movie_url=scene_movie_url(slug, cinema=cinema)))
+        for cinema in SCENE_CINEMAS if cinemas == "all" or cinema in cinemas]
+
+
+def vox_movie_sources(slug: str, cinemas: str | list[str]) -> list[MoviePages]:
+    return [MoviePages(build_url=partial(vox_movie_url, slug), parse=parse_movie_showtimes_vox)]
 
 
 SITES: "dict[str, Site]" = {
@@ -628,13 +654,13 @@ SITES: "dict[str, Site]" = {
         headers=SCENE_HEADERS,
         empty_is_expected=scene_empty_is_expected,
         soldout_label="sold out",
-        default_cinema=SCENE_CINEMA_NAME,
-        movie_url=scene_movie_url,
+        default_cinema_slug="district-5",
+        cinemas=SCENE_CINEMAS,
+        movie_sources=scene_movie_sources,
         movie_dates=scene_movie_dates,
-        movie_parse=parse_movie_showtimes_scene,
+        discovery_empty_is_expected=lambda html: not html.strip() or "no showtimes" in html.lower(),
         movie_title=scene_movie_title,
-        movie_cinemas=tuple(SCENE_CINEMAS),
-        cinema_names={slug: details[1] for slug, details in SCENE_CINEMAS.items()},
+        cinema_names={slug: details.name for slug, details in SCENE_CINEMAS.items()},
     ),
     "vox": Site(
         build_url=vox_url,
@@ -645,9 +671,11 @@ SITES: "dict[str, Site]" = {
         # VOX shows one "unavailable" state for both sold out and not-yet-on-sale, and
         # times routinely flip from unavailable to bookable — so don't claim "sold out".
         soldout_label="not bookable",
-        movie_url=vox_movie_url,
+        require_cinema=True,
+        movie_sources=vox_movie_sources,
         movie_dates=vox_movie_dates,
-        movie_parse=parse_movie_showtimes_vox,
+        discovery_date=vox_discovery_date,
+        discovery_empty_is_expected=vox_empty_is_expected,
         movie_title=vox_movie_title,
         cinema_names={
             "city-centre-alexandria": "City Centre Alexandria",
@@ -698,15 +726,19 @@ def format_message(movie: str, cinema: str, target_date: date,
     return "\n".join(lines)
 
 
+def escape_discord(text: str) -> str:
+    return re.sub(r"([\\`*_\[\]<>|~])", r"\\\1", text)
+
+
 def format_discord_message(movie: str, cinema: str, target_date: date,
                            groups: "dict[str, list[Showtime]]",
                            soldout_label: str = "sold out",
                            headline: str = "showtimes are live!") -> str:
     """Format the same Date watch in Discord markdown."""
     date_str = f"{target_date:%A, %B} {target_date.day}, {target_date:%Y}"
-    lines = [f"\U0001f3ac **{movie}** {headline}", f"\U0001f4cd {cinema}", f"\U0001f4c5 {date_str}"]
+    lines = [f"\U0001f3ac **{escape_discord(movie)}** {headline}", f"\U0001f4cd {escape_discord(cinema)}", f"\U0001f4c5 {date_str}"]
     for experience, times in groups.items():
-        lines.extend(["", f"**{experience}**"])
+        lines.extend(["", f"**{escape_discord(experience)}**"])
         for st in times:
             if st.soldout:
                 lines.append(f"\u2022 ~~{st.time}~~ ({soldout_label})")
@@ -721,49 +753,39 @@ def build_alert(watch: Watch, movie: str, cinema: str, target: date,
                 groups: "dict[str, list[Showtime]]", soldout_label: str,
                 headline: str) -> Alert:
     """Render only the Watch's chosen Channels, including Discord Mentions."""
-    texts = {}
-    for channel in watch.channels:
-        formatter = format_message if channel == "telegram" else format_discord_message
-        text = formatter(movie, cinema, target, groups, soldout_label, headline)
-        if channel == "discord" and watch.mention:
-            text = " ".join(f"<@{uid}>" for uid in watch.mention) + "\n" + text
-        texts[channel] = text
+    texts = {channel: CHANNELS[channel].mention_prefix(watch.mention) +
+             CHANNELS[channel].format_date(movie, cinema, target, groups, soldout_label, headline)
+             for channel in watch.channels}
     return Alert(texts=texts, mentions=list(watch.mention))
 
 
-def split_discord_text(text: str) -> list[str]:
-    """Keep lines together within 2000 characters; hard-split an oversized line."""
+def split_text(text: str, limit: int, hard_split: bool = False) -> list[str]:
+    """Keep lines intact; hard splitting is safe only for plain-text Channels."""
     chunks = []
     current = ""
-    for line in text.splitlines(keepends=True):
-        if current and len(current) + len(line) > 2000:
-            chunks.append(current)
+    for line in text.splitlines(keepends=hard_split):
+        if not hard_split and len(line) > limit:
+            raise ValueError(f"Telegram Alert line exceeds {limit} characters")
+        joined = current + ("" if hard_split else "\n") + line if current else line
+        if len(joined) > limit:
+            if current:
+                chunks.append(current)
             current = ""
-        while len(line) > 2000:
-            chunks.append(line[:2000])
-            line = line[2000:]
-        current += line
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = current + ("" if hard_split else "\n") + line if current else line
     if current:
         chunks.append(current)
     return chunks
 
 
+def split_discord_text(text: str) -> list[str]:
+    return split_text(text, 2000, hard_split=True)
+
+
 def telegram_messages(text: str) -> list[str]:
-    """Split an Alert at line boundaries so HTML links and labels stay intact."""
-    messages = []
-    current = ""
-    for line in text.splitlines():
-        if len(line) > 4096:
-            raise ValueError("Telegram Alert line exceeds 4096 characters")
-        joined = f"{current}\n{line}" if current else line
-        if len(joined) > 4096:
-            messages.append(current)
-            current = line
-        else:
-            current = joined
-    if current:
-        messages.append(current)
-    return messages
+    return split_text(text, 4096)
 
 
 def send_telegram(token: str, chat_id: str, text: str) -> None:
@@ -797,18 +819,48 @@ def send_discord(webhook_url: str, text: str, mentions: list[str]) -> None:
             raise RuntimeError(f"Discord API error {r.status_code}: {r.text}")
 
 
+def discord_mention_prefix(mentions: list[str]) -> str:
+    return " ".join(f"<@{uid}>" for uid in mentions) + "\n" if mentions else ""
+
+
+def deliver_telegram(cfg: Config, text: str, mentions: list[str]) -> None:
+    for part in telegram_messages(text):
+        send_telegram(cfg.telegram_token, cfg.telegram_chat_id, part)
+
+
+@dataclass(frozen=True)
+class Channel:
+    format_date: Callable
+    escape: Callable[[str], str]
+    bold_template: str
+    link_template: str
+    escape_url: Callable[[str], str]
+    send: Callable[[Config, str, list[str]], None]
+    credentials: tuple[str, ...]
+    mention_prefix: Callable[[list[str]], str] = lambda mentions: ""
+
+    def bold(self, text: str) -> str:
+        return self.bold_template.format(self.escape(text))
+
+    def link(self, st: Showtime) -> str:
+        return self.link_template.format(time=self.escape(st.time), href=self.escape_url(st.href))
+
+
+CHANNELS = {
+    "telegram": Channel(format_message, escape, "<b>{}</b>", '<a href="{href}">{time}</a>', escape,
+                        deliver_telegram, ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")),
+    "discord": Channel(format_discord_message, escape_discord, "**{}**", "[{time}]({href})", lambda url: url,
+                       lambda cfg, text, mentions: send_discord(cfg.discord_webhook_url, text, mentions),
+                       ("DISCORD_WEBHOOK_URL",), discord_mention_prefix),
+}
+
+
 def send_alert(cfg: Config, alert: Alert) -> None:
     """Attempt every Channel; any failure prevents this Watch's state being committed."""
     failures = []
     for channel, text in alert.texts.items():
         try:
-            if channel == "telegram":
-                for part in telegram_messages(text):
-                    send_telegram(cfg.telegram_token, cfg.telegram_chat_id, part)
-            elif channel == "discord":
-                send_discord(cfg.discord_webhook_url, text, alert.mentions)
-            else:
-                raise RuntimeError(f"unknown channel {channel!r}")
+            CHANNELS[channel].send(cfg, text, alert.mentions)
         except Exception as exc:  # noqa: BLE001 — attempt the other Channels too
             failures.append(f"{channel}: {exc}")
     if failures:
@@ -849,65 +901,101 @@ def save_state(path: Path, state: dict) -> None:
 
 def format_movie_message(channel: str, movie: str, groups: dict, count: int) -> str:
     """Render New Showtimes grouped Cinema -> date -> Experience for one Channel."""
-    tg = channel == "telegram"
-    name = f"<b>{escape(movie)}</b>" if tg else f"**{movie}**"
-    lines = [f"\U0001f3ac {name} is now bookable! {count} New Showtimes"]
+    adapter = CHANNELS[channel]
+    name = adapter.bold(movie)
+    lines = [f"\U0001f3ac {name} is now bookable! {count} New Showtime{'' if count == 1 else 's'}"]
     for cinema, dates in groups.items():
-        lines.extend(["", f"\U0001f4cd {escape(cinema) if tg else cinema}"])
+        lines.extend(["", f"\U0001f4cd {adapter.escape(cinema)}"])
         for target, experiences in sorted(dates.items()):
             lines.append(f"\U0001f4c5 {target:%A, %B} {target.day}, {target:%Y}")
             for experience, times in experiences.items():
-                lines.extend(["", f"<b>{escape(experience)}</b>" if tg else f"**{experience}**"])
+                lines.extend(["", adapter.bold(experience)])
                 for st in times:
-                    lines.append(f'• <a href="{escape(st.href, quote=True)}">{escape(st.time)}</a>'
-                                 if tg else f"• [{st.time}]({st.href})")
+                    lines.append("\u2022 " + adapter.link(st))
     return "\n".join(lines)
 
 
-class MovieWatchFailure(RuntimeError):
-    """A partially failed Movie watch, carrying Alerts and state from successful pages."""
-    def __init__(self, failures: list[str], result: tuple[list[Alert], dict]):
-        super().__init__("; ".join(failures))
-        self.result = result
+class WatchResult(NamedTuple):
+    alerts: list[Alert]
+    state: dict
+    failures: tuple[str, ...] = ()
+
+
+def warn_markup(watch_id: str, url: str, detail: str = "no showtimes AND no expected empty-state marker") -> None:
+    log.warning("[%s] %s - the page structure may have changed (%s)", watch_id, detail, url)
+
+
+def discover_dates(watch: MovieWatch, site: Site, source: MoviePages, fetch) -> tuple[str, list[date]]:
+    url = source.build_url(None)
+    html = fetch(url, site.headers)
+    targets = site.movie_dates(html)
+    if not targets and not site.discovery_empty_is_expected(html):
+        warn_markup(watch.id, url)
+    return html, targets
+
+
+def fetch_showtimes(watch: MovieWatch, site: Site, source: MoviePages, fetch,
+                    discovery: str, target: date) -> list[Showtime]:
+    url = source.build_url(target)
+    html = discovery if target == site.discovery_date(discovery) else fetch(url, site.headers)
+    showtimes = source.parse(html, target)
+    if not showtimes and not site.empty_is_expected(html):
+        warn_markup(watch.id, url)
+    return showtimes
+
+
+def filter_cinemas(watch: MovieWatch, site: Site, showtimes: list[Showtime], url: str) -> list[Showtime]:
+    selected = []
+    for cinema in dict.fromkeys(st.cinema for st in showtimes):
+        slug = site.cinema_slug(cinema)
+        if slug is None:
+            warn_markup(watch.id, url, f"unknown Cinema {cinema!r}")
+        if watch.cinemas == "all" or slug in watch.cinemas:
+            selected.extend(st for st in showtimes if st.cinema == cinema)
+    return selected
+
+
+def new_showtimes(showtimes: list[Showtime], alerted: dict, target: date) -> list[Showtime]:
+    new = []
+    for st in showtimes:
+        if not st.soldout and st.identity not in alerted:
+            alerted[st.identity] = target.strftime("%Y%m%d")
+            new.append(st)
+    return new
+
+
+class PacedFetch:
+    """Share the pause between page fetches across every Watch in a run."""
+    def __init__(self, fetch, sleep=None):
+        self.fetch = fetch
+        self.sleep = sleep
+        self.fetched = False
+
+    def __call__(self, url, headers):
+        if self.fetched and self.sleep is not None:
+            self.sleep(1)
+        self.fetched = True
+        return self.fetch(url, headers)
 
 
 def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state: dict,
-                    now: datetime, sleep: Optional[Callable[[float], None]]) -> tuple[list[Alert], dict]:
-    """Collect New Showtimes through Site adapters into one Alert."""
-    alerted = dict(state.get("movie_alerted", {}).get(watch.id, {}))
+                    now: datetime) -> WatchResult:
+    """Collect New Showtimes through Site adapters, retaining successful pages on failure."""
+    alerted = {identity: target for identity, target in
+               state.get("movie_alerted", {}).get(watch.id, {}).items()
+               if target >= now.strftime("%Y%m%d")}
     groups = {}
     movie = ""
-    fetched = False
     failures = []
-
-    def page(url, site, discovery=False):
-        nonlocal fetched
-        if fetched and sleep is not None:
-            sleep(1)
-        fetched = True
-        html = fetch(url, site.headers)
-        if not discovery and not site.parse(html) and not site.empty_is_expected(html):
-            log.warning("[%s] no showtimes AND no expected empty-state marker - "
-                        "the page structure may have changed (%s)", watch.id, url)
-        return html
-
     for name, slugs in watch.movie.items():
-        if not slugs:
-            continue
         site = SITES[name]
         if watch.cinemas != "all" and not any(c in site.cinema_names for c in watch.cinemas):
             continue
         for slug in slugs:
-            for cinema in site.movie_cinemas:
-                if cinema and watch.cinemas != "all" and cinema not in watch.cinemas:
-                    continue
-                url = site.movie_url(slug, None, cinema)
+            for source in site.movie_sources(slug, watch.cinemas):
+                url = source.build_url(None)
                 try:
-                    discovery = page(url, site, discovery=True)
-                    targets = site.movie_dates(discovery)
-                    if not targets and not site.parse(discovery) and not site.empty_is_expected(discovery):
-                        log.warning("[%s] no showtimes AND no expected empty-state marker - "
-                                    "the page structure may have changed (%s)", watch.id, url)
+                    discovery, targets = discover_dates(watch, site, source, fetch)
                     if not movie:
                         movie = site.movie_title(discovery, slug)
                 except Exception as exc:
@@ -917,73 +1005,50 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
                 for target in targets:
                     if target < now.date():
                         continue
-                    date_url = site.movie_url(slug, target, cinema)
+                    date_url = source.build_url(target)
                     try:
-                        html = page(date_url, site)
-                        showtimes = site.movie_parse(html, target, cinema)
-                        for st in showtimes:
-                            if watch.cinemas != "all" and site.cinema_slug(st.cinema) not in watch.cinemas:
-                                continue
-                            if st.soldout or st.identity in alerted:
-                                continue
-                            # Scene links to the movie page rather than a transient booking URL.
-                            if not st.href:
-                                st = Showtime(time=st.time, href=url, identity=st.identity,
-                                              cinema=st.cinema, experience=st.experience, date=st.date)
-                            alerted[st.identity] = target.strftime("%Y%m%d")
+                        showtimes = fetch_showtimes(watch, site, source, fetch, discovery, target)
+                        selected = filter_cinemas(watch, site, showtimes, date_url)
+                        for st in new_showtimes(selected, alerted, target):
                             groups.setdefault(st.cinema, {}).setdefault(target, {}).setdefault(st.experience, []).append(st)
                     except Exception as exc:
                         log.error("[%s] failed %s: %s", watch.id, date_url, exc)
                         failures.append(f"{date_url}: {exc}")
     if not groups:
-        if failures:
-            raise MovieWatchFailure(failures, ([], state))
-        return [], state
+        return WatchResult([], state, tuple(failures))
     count = sum(len(times) for dates in groups.values()
                 for experiences in dates.values() for times in experiences.values())
-    texts = {}
-    for channel in watch.channels:
-        text = format_movie_message(channel, movie, groups, count)
-        if channel == "discord" and watch.mention:
-            text = " ".join(f"<@{uid}>" for uid in watch.mention) + "\n" + text
-        texts[channel] = text
+    texts = {channel: CHANNELS[channel].mention_prefix(watch.mention) +
+             format_movie_message(channel, movie, groups, count) for channel in watch.channels}
     proposed = {**state, "movie_alerted": {**state.get("movie_alerted", {}), watch.id: alerted}}
-    result = ([Alert(texts=texts, mentions=list(watch.mention))], proposed)
-    if failures:
-        raise MovieWatchFailure(failures, result)
-    return result
+    return WatchResult([Alert(texts=texts, mentions=list(watch.mention))], proposed, tuple(failures))
 
 
 def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], state: dict,
-              now: datetime, sleep: Optional[Callable[[float], None]] = None) -> tuple[list[Alert], dict]:
+              now: datetime, sleep: Optional[Callable[[float], None]] = None) -> WatchResult:
     """Evaluate one Watch, returning Alerts and proposed state without delivery.
 
     The caller commits the proposed state only after all Alerts have been delivered.
-    MovieWatchFailure carries that same result if some pages failed. No clock or sleep
+    Failures accompany successful Movie pages in the result. No clock or sleep
     is used here unless the caller injects it.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be an aware datetime")
     now = now.astimezone(ZoneInfo(watch.timezone))
+    if not isinstance(fetch, PacedFetch):
+        fetch = PacedFetch(fetch, sleep)
     if isinstance(watch, MovieWatch):
-        # Prune only this Watch: each Movie watch has its own timezone. Cleanup can
-        # be saved without an Alert; new identities still require successful delivery.
-        previous = state.get("movie_alerted", {}).get(watch.id, {})
-        today = now.strftime("%Y%m%d")
-        retained = {identity: target for identity, target in previous.items() if target >= today}
-        if retained != previous:
-            state = {**state, "movie_alerted": {**state["movie_alerted"], watch.id: retained}}
         if watch.until is not None and now.date() > watch.until:
             log.info("[%s] until date %s has passed - skipping", watch.id, watch.until.isoformat())
-            return [], state
-        return run_movie_watch(watch, fetch, state, now, sleep)
+            return WatchResult([], state)
+        return run_movie_watch(watch, fetch, state, now)
     site = SITES[watch.site]
     target = resolve_target_date(watch, now=now)
     dedupe_key = target.strftime("%Y%m%d")
 
     if watch.target_date is not None and target < today_in(watch.timezone, now=now):
         log.info("[%s] target date %s has passed — skipping", watch.id, target.isoformat())
-        return [], state
+        return WatchResult([], state)
 
     url = site.build_url(watch, target)
     log.info("[%s] checking %s on %s", watch.id, watch.movie_slug, target.isoformat())
@@ -995,10 +1060,9 @@ def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], stat
 
     if total == 0:
         if not site.empty_is_expected(html):
-            log.warning("[%s] no showtimes AND no expected empty-state marker — "
-                        "the page structure may have changed", watch.id)
+            warn_markup(watch.id, url)
         log.info("[%s] No showtimes yet for %s", watch.id, target.isoformat())
-        return [], state
+        return WatchResult([], state)
 
     bookable = sum(1 for v in groups.values() for s in v if not s.soldout)
     log.info("[%s] Found %d showtimes (%d bookable) across %d screen types: %s",
@@ -1008,18 +1072,18 @@ def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], stat
         # notify_on="bookable": the date is published but sales haven't opened. Stay
         # silent and keep checking — state is deliberately not written here.
         log.info("[%s] %d showtimes listed but none bookable yet — waiting", watch.id, total)
-        return [], state
+        return WatchResult([], state)
 
     if state["notified_for"].get(watch.id) == dedupe_key:
         log.info("[%s] Already notified for %s", watch.id, dedupe_key)
-        return [], state
+        return WatchResult([], state)
 
     movie, cinema = site.display_names(html, watch)
     headline = "is now bookable!" if watch.notify_on == "bookable" else "showtimes are live!"
     alert = build_alert(watch, movie, cinema, target, groups,
                         soldout_label=site.soldout_label, headline=headline)
     next_state = {**state, "notified_for": {**state["notified_for"], watch.id: dedupe_key}}
-    return [alert], next_state
+    return WatchResult([alert], next_state)
 
 
 def main() -> int:
@@ -1029,27 +1093,25 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    cfg = load_config([], os.environ)
-    watches = load_watches(cfg.watches_path, cfg.default_timezone)
+    path, timezone = watch_defaults(os.environ)
+    watches = load_watches(path, timezone)
     cfg = load_config(watches, os.environ)
     state = load_state(DEFAULT_STATE_PATH, watches)
     log.info("loaded %d watch(es): %s", len(watches), ", ".join(w.id for w in watches))
 
     changed = False
     failures: list[str] = []
+    fetch = PacedFetch(fetch_page, time.sleep)
     for watch in watches:
         try:
-            try:
-                alerts, next_state = run_watch(
-                    watch, fetch_page, state, datetime.now(ZoneInfo(watch.timezone)),
-                    sleep=time.sleep)
-            except MovieWatchFailure as exc:
-                alerts, next_state = exc.result
+            result = run_watch(watch, fetch, state, datetime.now(ZoneInfo(watch.timezone)))
+            alerts, next_state, page_failures = result
+            if page_failures:
                 failures.append(watch.id)
             for alert in alerts:
                 send_alert(cfg, alert)
                 log.info("[%s] Alert sent to %s", watch.id, ", ".join(alert.texts))
-            if next_state != state:
+            if alerts and next_state != state:
                 state = next_state
                 changed = True
         except Exception as e:  # noqa: BLE001 — one watch must not sink the others

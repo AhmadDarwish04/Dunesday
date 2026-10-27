@@ -1,6 +1,6 @@
 # Cinema Showtime Notifier
 
-Get a Telegram or Discord Alert the moment a movie's showtimes go live — so you can book before it sells out.
+Get a Telegram or Discord Alert the moment a movie's Showtimes become Published or Bookable — so you can book before it sells out.
 
 Checks every 15 minutes via GitHub Actions. Date watches send one Alert per date; Movie watches send an Alert for each batch of New Showtimes.
 
@@ -253,7 +253,7 @@ python check_showtimes.py     # ⚠️ really sends messages and updates state.j
 python send_test_message.py   # sample alert per watch
 ```
 
-To try out a config without touching the live one, point `WATCHES_FILE` at a scratch file:
+To try out a config without touching the production one, point `WATCHES_FILE` at a scratch file:
 
 ```bash
 WATCHES_FILE=my-test.json python check_showtimes.py     # macOS / Linux

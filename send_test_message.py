@@ -24,6 +24,8 @@ from datetime import date, timedelta
 
 from check_showtimes import (
     SITES,
+    CHANNELS,
+    watch_defaults,
     Alert,
     MovieWatch,
     Showtime,
@@ -98,20 +100,17 @@ def sample_movie_alert(watch: MovieWatch, today: date) -> Alert:
         },
     }
     slug = next(slug for slugs in watch.movie.values() for slug in slugs)
-    texts = {}
-    for channel in watch.channels:
-        text = format_movie_message(channel, title_from_slug(slug), groups, 4)
-        if channel == "discord" and watch.mention:
-            text = " ".join(f"<@{uid}>" for uid in watch.mention) + "\n" + text
-        texts[channel] = text
+    texts = {channel: CHANNELS[channel].mention_prefix(watch.mention) +
+             format_movie_message(channel, title_from_slug(slug), groups, 4)
+             for channel in watch.channels}
     return Alert(texts=texts, mentions=list(watch.mention))
 
 
 def main(argv: "list[str]") -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    cfg = load_config([], os.environ)
-    watches = load_watches(cfg.watches_path, cfg.default_timezone)
+    path, timezone = watch_defaults(os.environ)
+    watches = load_watches(path, timezone)
     wanted = set(argv)
     if wanted:
         unknown = wanted - {w.id for w in watches}
@@ -140,7 +139,7 @@ def main(argv: "list[str]") -> int:
             )
         texts = {}
         for channel, text in alert.texts.items():
-            banner = BANNER if channel == "telegram" else BANNER.replace("<b>", "**").replace("</b>", "**")
+            banner = BANNER.replace("<b>TEST</b>", CHANNELS[channel].bold("TEST"))
             texts[channel] = banner + "\n\n" + text
         log.info("[%s] sending sample to %s", watch.id, ", ".join(texts))
         try:
