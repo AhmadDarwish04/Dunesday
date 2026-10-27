@@ -748,7 +748,6 @@ def test_parse_scene_cairo_festival_city_showtimes():
     assert all(not showtime.soldout and showtime.href.startswith("https://cfc.scenecinemas.com/")
                for showtime in groups["Standard"])
 
-
 def test_run_scene_date_watch_with_base_url_override(tmp_path):
     path = _write_watches(tmp_path, [{
         "id": "cfc", "site": "scene", "movie_slug": "resident_evil",
@@ -909,10 +908,9 @@ def test_main_movie_watch_partial_failure_commits_only_delivered_alerts(tmp_path
     ({"notify_on": "published"}, "cannot mix"),
     ({"movie": {"vox": [], "scene": []}}, "at least one Movie slug"),
     ({"movie": {"unknown": ["avengers"]}}, "unknown Site"),
-    ({"movie": {"scene": ["avengers"]}}, "not yet supported"),
     ({"movie": {"vox": "avengers"}}, "list of non-empty strings"),
     ({"movie": {"vox": [""]}}, "list of non-empty strings"),
-    ({"cinemas": ["mall-of-egypt"]}, "requires cinemas"),
+    ({"cinemas": ["unknown"]}, "unknown Cinema"),
     ({"timezone": "Unknown/Timezone"}, "unknown timezone"),
 ])
 def test_movie_watch_rejects_bad_config(tmp_path, extra, message):
@@ -949,3 +947,145 @@ def test_vox_movie_date_picker_includes_bare_current_date_and_every_link():
     from check_showtimes import vox_movie_dates
     assert vox_movie_dates(_read("vox_movie.html")) == [date(2026, 12, day) for day in range(16, 24)]
     assert vox_movie_dates(_read("vox_movie_second_date.html")) == [date(2026, 12, day) for day in range(16, 24)]
+
+SCENE_MOVIE_NOW = datetime(2026, 10, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+
+
+def _scene_movie_pages():
+    pages = {}
+    for host in ("district5", "cfc"):
+        url = f"https://{host}.scenecinemas.com/movie-details/resident_evil.html"
+        pages[url] = f"scene_movie_{host}.html"
+        for day in (27, 28):
+            pages[f"{url}?business_day={day}-10-2026&ajax=1"] = f"scene_movie_{host}_{day}-10-2026.html"
+    return pages
+
+def test_run_scene_movie_watch_discovers_both_cinemas_and_dates_and_alerts_once(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"scene": ["resident_evil"], "vox": []})
+    initial = {"notified_for": {"date-watch": "20260731"}}
+    fetch = _fixture_fetch(_scene_movie_pages())
+    alerts, proposed = run_watch(watch, fetch, initial, SCENE_MOVIE_NOW)
+    assert len(alerts) == 1
+    for channel, text in alerts[0].texts.items():
+        assert "Resident Evil" in text and "11 New Showtimes" in text
+        assert "District 5" in text and "Cairo Festival City" in text
+        assert "Tuesday, October 27, 2026" in text and "Wednesday, October 28, 2026" in text
+        assert "Standard &amp; Deluxe" in text if channel == "telegram" else "Standard & Deluxe" in text
+        assert "https://district5.scenecinemas.com/movie-details/resident_evil.html" in text
+        assert "https://cfc.scenecinemas.com/movie-details/resident_evil.html" in text
+        assert "/showtime-" not in text
+    assert len(proposed["movie_alerted"]["avengers"]) == 11
+    assert set(proposed["movie_alerted"]["avengers"].values()) == {"20261027", "20261028"}
+    assert proposed["notified_for"] == initial["notified_for"]
+    assert initial == {"notified_for": {"date-watch": "20260731"}}
+    assert run_watch(watch, fetch, proposed, SCENE_MOVIE_NOW) == ([], proposed)
+
+
+def test_run_scene_movie_watch_soldout_never_alerts_and_later_bookable_alerts_once(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"scene": ["resident_evil"]})
+    pages = _scene_movie_pages()
+    url = "https://district5.scenecinemas.com/movie-details/resident_evil.html?business_day=28-10-2026&ajax=1"
+    pages[url] = "scene_movie_district5_soldout.html"
+    alerts, state = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, SCENE_MOVIE_NOW)
+    assert "9 New Showtimes" in alerts[0].texts["telegram"]
+    district = alerts[0].texts["telegram"].split("Cairo Festival City")[0]
+    assert "08:00 PM" not in district and "10:00 PM" not in district
+    bookable = _fixture_fetch(_scene_movie_pages())
+    alerts, state = run_watch(watch, bookable, state, SCENE_MOVIE_NOW)
+    assert len(alerts) == 1 and "2 New Showtimes" in alerts[0].texts["telegram"]
+    assert "08:00 PM" in alerts[0].texts["telegram"] and "10:00 PM" in alerts[0].texts["telegram"]
+    assert len(state["movie_alerted"]["avengers"]) == 11
+    assert run_watch(watch, _fixture_fetch(pages), state, SCENE_MOVIE_NOW) == ([], state)
+    assert run_watch(watch, bookable, state, SCENE_MOVIE_NOW) == ([], state)
+
+@pytest.mark.parametrize("cinemas,expected,excluded", [
+    (["district-5", "city-centre-almaza"], ["District 5", "City Centre Almaza"],
+     ["Cairo Festival City", "City Centre Alexandria", "Mall of Egypt"]),
+    (["cairo-festival-city"], ["Cairo Festival City"],
+     ["District 5", "City Centre Almaza", "City Centre Alexandria", "Mall of Egypt"]),
+])
+def test_run_movie_watch_cinema_list_filters_across_sites(tmp_path, cinemas, expected, excluded):
+    watch = _movie_watch(tmp_path, movie={"scene": ["resident_evil"],
+                                        "vox": ["avengers-doomsday-infinity-vision"]}, cinemas=cinemas)
+    pages = {**_scene_movie_pages(), **_movie_pages()}
+    skipped = "cfc" if "district-5" in cinemas else "district5"
+    pages = {url: fixture for url, fixture in pages.items() if f"https://{skipped}." not in url}
+    alerts, proposed = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, SCENE_MOVIE_NOW)
+    assert len(alerts) == 1
+    text = alerts[0].texts["telegram"]
+    assert all(name in text for name in expected)
+    assert all(name not in text for name in excluded)
+    assert len(proposed["movie_alerted"]["avengers"]) > 0
+
+
+@pytest.mark.parametrize("failed_site,count", [(None, 93), ("vox", 11), ("scene", 82)])
+def test_run_movie_watch_combines_sites_and_keeps_successful_site_after_failure(tmp_path, failed_site, count):
+    from check_showtimes import MovieWatchFailure
+    watch = _movie_watch(tmp_path, movie={"vox": ["avengers-doomsday-infinity-vision"],
+                                        "scene": ["resident_evil"]})
+    pages = {**_movie_pages(), **_scene_movie_pages()}
+    if failed_site:
+        pages = {url: fixture for url, fixture in pages.items()
+                 if ("voxcinemas.com" if failed_site == "vox" else "scenecinemas.com") not in url}
+    initial = {"notified_for": {}}
+    if failed_site:
+        with pytest.raises(MovieWatchFailure) as caught:
+            run_watch(watch, _fixture_fetch(pages), initial, SCENE_MOVIE_NOW)
+        alerts, proposed = caught.value.result
+    else:
+        alerts, proposed = run_watch(watch, _fixture_fetch(pages), initial, SCENE_MOVIE_NOW)
+    assert len(alerts) == 1
+    assert len(proposed["movie_alerted"]["avengers"]) == count
+    for text in alerts[0].texts.values():
+        assert f"{count} New Showtimes" in text
+        assert ("City Centre Almaza" in text) is (failed_site != "vox")
+        assert ("District 5" in text) is (failed_site != "scene")
+        assert ("Cairo Festival City" in text) is (failed_site != "scene")
+        if not failed_site:
+            assert text.count("City Centre Almaza") == 1 and text.count("District 5") == 1
+    assert initial == {"notified_for": {}}
+
+@pytest.mark.parametrize("failed_site,count", [("vox", 11), ("scene", 82)])
+def test_main_cross_site_failure_delivers_successful_site_and_exits_nonzero(tmp_path, monkeypatch, failed_site, count):
+    import check_showtimes as notifier
+    path = _write_watches(tmp_path, [{"id": "combined", "movie": {
+        "vox": ["avengers-doomsday-infinity-vision"], "scene": ["resident_evil"]},
+        "cinemas": "all", "channels": ["discord"]}])
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("WATCHES_FILE", str(path))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.example/webhook")
+    monkeypatch.setattr(notifier, "DEFAULT_STATE_PATH", state_path)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return SCENE_MOVIE_NOW.astimezone(tz)
+
+    monkeypatch.setattr(notifier, "datetime", FrozenDatetime)
+    monkeypatch.setattr(notifier.time, "sleep", lambda _: None)
+    pages = _scene_movie_pages() if failed_site == "vox" else _movie_pages()
+    monkeypatch.setattr(notifier, "fetch_page", _fixture_fetch(pages))
+    delivered = []
+    monkeypatch.setattr(notifier, "send_discord", lambda url, text, mentions: delivered.append(text))
+    assert notifier.main() == 1
+    assert len(delivered) == 1 and f"{count} New Showtimes" in delivered[0]
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(saved["movie_alerted"]["combined"]) == count
+
+
+def test_run_scene_movie_watch_identity_includes_experience_but_not_movie_slug(tmp_path):
+    watch = _movie_watch(tmp_path, movie={"scene": ["resident_evil", "resident-evil-variant"]})
+    pages = _scene_movie_pages()
+    pages.update({url.replace("resident_evil", "resident-evil-variant"): fixture
+                  for url, fixture in list(pages.items())})
+    alerts, state = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, SCENE_MOVIE_NOW)
+    assert len(alerts) == 1 and "11 New Showtimes" in alerts[0].texts["telegram"]
+    # These same Cinemas, dates and times are already alerted for both slugs.
+    pages["https://district5.scenecinemas.com/movie-details/resident-evil-variant.html?business_day=28-10-2026&ajax=1"] = "scene_movie_district5_premiere.html"
+    alerts, proposed = run_watch(watch, _fixture_fetch(pages), state, SCENE_MOVIE_NOW)
+    text = alerts[0].texts["telegram"]
+    assert len(alerts) == 1 and "3 New Showtimes" in text and "<b>Premiere</b>" in text
+    assert "08:00 PM" in text and "10:00 PM" in text and "12:15 AM" in text
+    assert "Standard" not in text and "Cairo Festival City" not in text
+    assert len(proposed["movie_alerted"]["avengers"]) == 14
+    assert run_watch(watch, _fixture_fetch(pages), proposed, SCENE_MOVIE_NOW) == ([], proposed)

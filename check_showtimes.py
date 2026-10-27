@@ -120,11 +120,11 @@ class Watch:
 
 @dataclass(frozen=True)
 class MovieWatch:
-    """A movie across all Cinemas and every Published date on VOX."""
+    """A movie across Cinemas and every Published date on its Sites."""
     id: str
     movie: dict[str, list[str]]
     timezone: str
-    cinemas: str = "all"
+    cinemas: str | list[str] = "all"
     channels: list[str] = field(default_factory=lambda: ["telegram", "discord"])
     mention: list[str] = field(default_factory=list)
 
@@ -163,10 +163,13 @@ class Site:
     soldout_label: str
     # Cinema name to use when the watch has no cinema_slug (single-venue sites).
     default_cinema: str = ""
-    movie_url: Optional[Callable[[str, Optional[date]], str]] = None
+    movie_url: Optional[Callable[[str, Optional[date], str], str]] = None
     movie_dates: Optional[Callable[[str], list[date]]] = None
-    movie_parse: Optional[Callable[[str, date], list[Showtime]]] = None
+    movie_parse: Optional[Callable[[str, date, str], list[Showtime]]] = None
     movie_title: Optional[Callable[[str, str], str]] = None
+    # Scene discovers dates per Cinema; VOX discovers all Cinemas on one page.
+    movie_cinemas: tuple[str, ...] = ("",)
+    cinema_names: dict[str, str] = field(default_factory=dict)
 
 
 def load_config(watches: list[Watch], env: Mapping[str, str]) -> Config:
@@ -244,17 +247,21 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
                     raise RuntimeError(f"{where}: {name} Movie slugs must be a list of non-empty strings")
             if not any(movie.values()):
                 raise RuntimeError(f"{where}: Movie watch needs at least one Movie slug")
-            if movie.get("scene"):
-                raise RuntimeError(f"{where}: Scene Movie watches are not yet supported")
-            if e.get("cinemas") != "all":
-                raise RuntimeError(f"{where}: Movie watch requires cinemas: 'all'")
+            cinemas = e.get("cinemas")
+            if cinemas != "all":
+                if not isinstance(cinemas, list) or not cinemas or any(not isinstance(c, str) for c in cinemas):
+                    raise RuntimeError(f"{where}: cinemas must be 'all' or a non-empty Cinema slug list")
+                known = {slug for site in SITES.values() for slug in site.cinema_names}
+                for cinema in cinemas:
+                    if cinema not in known:
+                        raise RuntimeError(f"{where}: unknown Cinema {cinema!r}")
             tz = str(e.get("timezone") or "").strip() or default_timezone
             try:
                 ZoneInfo(tz)
             except Exception as exc:
                 raise RuntimeError(f"{where}: unknown timezone {tz!r}") from exc
             channels, mention = parse_channels_and_mentions(e, where)
-            watches.append(MovieWatch(id=wid, movie=movie, timezone=tz,
+            watches.append(MovieWatch(id=wid, movie=movie, timezone=tz, cinemas=cinemas,
                                       channels=channels, mention=mention))
             continue
         if "cinemas" in e:
@@ -453,6 +460,31 @@ def scene_empty_is_expected(html: str) -> bool:
     return True
 
 
+def scene_movie_url(slug: str, target: Optional[date] = None, cinema: str = "district-5") -> str:
+    base = SCENE_CINEMAS[cinema][0].format(movie=slug)
+    return SCENE_SHOWTIMES_URL.format(base=base, date=target.strftime("%d-%m-%Y")) if target else base
+
+
+def scene_movie_dates(html: str) -> list[date]:
+    soup = BeautifulSoup(html, "html.parser")
+    return sorted({datetime.strptime(day["id"].removeprefix("data-"), "%d-%m-%Y").date()
+                   for day in soup.select("li.calanderdays[id]")})
+
+
+def scene_movie_title(html: str, slug: str) -> str:
+    heading = BeautifulSoup(html, "html.parser").select_one(".movie-name")
+    return heading.get_text(" ", strip=True) if heading else title_from_slug(slug)
+
+
+def parse_movie_showtimes_scene(html: str, target: date, cinema: str) -> list[Showtime]:
+    # Scene has no stable per-Showtime id. Movie variants share the same identity
+    # when Cinema, date, time and Experience match; booking URLs may change.
+    return [Showtime(time=st.time, href="", soldout=st.soldout,
+                     identity=f"scene:{cinema}:{target:%Y%m%d}:{st.time}:{experience}",
+                     cinema=SCENE_CINEMAS[cinema][1], experience=experience, date=target)
+            for experience, times in parse_showtimes_scene(html).items() for st in times]
+
+
 # ----------------------------------------------------------------------------- vox
 
 
@@ -539,7 +571,7 @@ def vox_movie_dates(html: str) -> list[date]:
     return sorted({datetime.strptime(value, "%Y%m%d").date() for value in values})
 
 
-def vox_movie_url(slug: str, target: Optional[date] = None) -> str:
+def vox_movie_url(slug: str, target: Optional[date] = None, cinema: str = "") -> str:
     url = f"https://egy.voxcinemas.com/showtimes?m={slug}"
     return f"{url}&d={target:%Y%m%d}" if target else url
 
@@ -550,7 +582,7 @@ def vox_movie_title(html: str, slug: str) -> str:
     return heading.get_text(" ", strip=True) if heading else title_from_slug(slug)
 
 
-def parse_movie_showtimes_vox(html: str, target: date) -> list[Showtime]:
+def parse_movie_showtimes_vox(html: str, target: date, cinema: str = "") -> list[Showtime]:
     """Read Bookable and Not bookable Showtimes with Cinema and stable VOX identity."""
     soup = BeautifulSoup(html, "html.parser")
     showtimes = []
@@ -581,6 +613,12 @@ SITES: "dict[str, Site]" = {
         empty_is_expected=scene_empty_is_expected,
         soldout_label="sold out",
         default_cinema=SCENE_CINEMA_NAME,
+        movie_url=scene_movie_url,
+        movie_dates=scene_movie_dates,
+        movie_parse=parse_movie_showtimes_scene,
+        movie_title=scene_movie_title,
+        movie_cinemas=tuple(SCENE_CINEMAS),
+        cinema_names={slug: details[1] for slug, details in SCENE_CINEMAS.items()},
     ),
     "vox": Site(
         build_url=vox_url,
@@ -595,6 +633,9 @@ SITES: "dict[str, Site]" = {
         movie_dates=vox_movie_dates,
         movie_parse=parse_movie_showtimes_vox,
         movie_title=vox_movie_title,
+        cinema_names={"city-centre-alexandria": "City Centre Alexandria",
+                      "city-centre-almaza": "City Centre Almaza",
+                      "mall-of-egypt": "Mall of Egypt"},
     ),
 }
 
@@ -814,20 +855,20 @@ class MovieWatchFailure(RuntimeError):
 
 def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state: dict,
                     now: datetime, sleep: Optional[Callable[[float], None]]) -> tuple[list[Alert], dict]:
-    """Collect New Showtimes through Site adapters into one Telegram Alert."""
+    """Collect New Showtimes through Site adapters into one Alert."""
     alerted = dict(state.get("movie_alerted", {}).get(watch.id, {}))
     groups = {}
     movie = ""
     fetched = False
     failures = []
 
-    def page(url, site):
+    def page(url, site, discovery=False):
         nonlocal fetched
         if fetched and sleep is not None:
             sleep(1)
         fetched = True
         html = fetch(url, site.headers)
-        if not site.parse(html) and not site.empty_is_expected(html):
+        if not discovery and not site.parse(html) and not site.empty_is_expected(html):
             log.warning("[%s] no showtimes AND no expected empty-state marker - "
                         "the page structure may have changed (%s)", watch.id, url)
         return html
@@ -836,32 +877,48 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
         if not slugs:
             continue
         site = SITES[name]
+        selected = None if watch.cinemas == "all" else {
+            display for slug, display in site.cinema_names.items() if slug in watch.cinemas}
+        if selected == set():
+            continue
         for slug in slugs:
-            url = site.movie_url(slug, None)
-            try:
-                discovery = page(url, site)
-                targets = site.movie_dates(discovery)
-            except Exception as exc:
-                log.error("[%s] failed %s: %s", watch.id, url, exc)
-                failures.append(f"{url}: {exc}")
-                continue
-            for target in targets:
-                if target < now.date():
+            for cinema in site.movie_cinemas:
+                if cinema and watch.cinemas != "all" and cinema not in watch.cinemas:
                     continue
-                date_url = site.movie_url(slug, target)
+                url = site.movie_url(slug, None, cinema)
                 try:
-                    html = page(date_url, site)
-                    showtimes = site.movie_parse(html, target)
+                    discovery = page(url, site, discovery=True)
+                    targets = site.movie_dates(discovery)
+                    if not targets and not site.parse(discovery) and not site.empty_is_expected(discovery):
+                        log.warning("[%s] no showtimes AND no expected empty-state marker - "
+                                    "the page structure may have changed (%s)", watch.id, url)
                     if not movie:
-                        movie = site.movie_title(html, slug)
-                    for st in showtimes:
-                        if st.soldout or st.identity in alerted:
-                            continue
-                        alerted[st.identity] = target.strftime("%Y%m%d")
-                        groups.setdefault(st.cinema, {}).setdefault(target, {}).setdefault(st.experience, []).append(st)
+                        movie = site.movie_title(discovery, slug)
                 except Exception as exc:
-                    log.error("[%s] failed %s: %s", watch.id, date_url, exc)
-                    failures.append(f"{date_url}: {exc}")
+                    log.error("[%s] failed %s: %s", watch.id, url, exc)
+                    failures.append(f"{url}: {exc}")
+                    continue
+                for target in targets:
+                    if target < now.date():
+                        continue
+                    date_url = site.movie_url(slug, target, cinema)
+                    try:
+                        html = page(date_url, site)
+                        showtimes = site.movie_parse(html, target, cinema)
+                        for st in showtimes:
+                            if selected is not None and st.cinema not in selected:
+                                continue
+                            if st.soldout or st.identity in alerted:
+                                continue
+                            # Scene links to the movie page rather than a transient booking URL.
+                            if not st.href:
+                                st = Showtime(time=st.time, href=url, identity=st.identity,
+                                              cinema=st.cinema, experience=st.experience, date=st.date)
+                            alerted[st.identity] = target.strftime("%Y%m%d")
+                            groups.setdefault(st.cinema, {}).setdefault(target, {}).setdefault(st.experience, []).append(st)
+                    except Exception as exc:
+                        log.error("[%s] failed %s: %s", watch.id, date_url, exc)
+                        failures.append(f"{date_url}: {exc}")
     if not groups:
         if failures:
             raise MovieWatchFailure(failures, ([], state))
