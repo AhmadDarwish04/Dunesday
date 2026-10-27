@@ -2,9 +2,9 @@
 
 Get a Telegram or Discord Alert the moment a movie's showtimes go live — so you can book before it sells out.
 
-Checks every 15 minutes via GitHub Actions. One Alert per Watch per date after successful delivery.
+Checks every 15 minutes via GitHub Actions. Date watches send one Alert per date; Movie watches send an Alert for each batch of New Showtimes.
 
-Works with **VOX Cinemas Egypt**, **Scene Cinemas District 5**, or both at once.
+Works with **VOX Cinemas Egypt**, **Scene Cinemas** (District 5 and Cairo Festival City), or both at once.
 
 ---
 
@@ -133,6 +133,33 @@ Add as many as you like. Each one is checked separately, gets its own message, a
 
 ---
 
+## Movie watches
+
+```json
+{
+  "watches": [{
+    "id": "avengers-doomsday",
+    "movie": {
+      "vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
+      "scene": []
+    },
+    "cinemas": "all",
+    "until": "2027-01-31",
+    "channels": ["telegram", "discord"],
+    "mention": ["123456789"]
+  }]
+}
+```
+
+A Movie watch discovers dates and Cinemas and Alerts on each New Showtime: a Bookable Showtime
+it has not alerted about before. The first run includes already Bookable Showtimes. Use `"all"` or
+a list of Cinema slugs (for example `["city-centre-almaza", "district-5"]`); an empty Site slug
+list skips that Site until you add its Movie slug. `until` is optional and stops the Watch after
+that date. Movie watches always wait for Bookable Showtimes; `target` and `notify_on` belong to
+Date watches. Both kinds accept `channels`, `mention`, and `timezone`.
+
+---
+
 ## Finding the slugs
 
 **VOX** — open the movie's showtimes page and read the URL:
@@ -210,7 +237,7 @@ To check the real thing is running: **Actions → Check Showtimes → Run workfl
 { "notified_for": { "odyssey-d5-friday": "20260731" } }
 ```
 
-To get an alert again, delete that watch's line and commit. Deleting the whole file resets everything.
+Movie watch state is stored under `movie_alerted` as Showtime identities and dates; past dates are pruned. To re-arm a Watch, delete its entry from the appropriate section and commit, or rename its id. Deleting the whole file resets everything.
 
 ---
 

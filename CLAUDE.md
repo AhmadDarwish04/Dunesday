@@ -5,13 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A single-purpose scraper + notifier: a GitHub Actions cron job runs `check_showtimes.py`, which
-checks whether a cinema has published showtimes for a given movie on a given date, and Telegrams
-once per watch when they go live. There is no server, no package, no build — the repo root *is* the
+checks Date watches for Published or Bookable Showtimes and Movie watches for New Showtimes,
+then sends Alerts to their Telegram and/or Discord Channels. There is no server, no package, no build — the repo root *is* the
 deployable unit. The one exception is `scheduler/`, an independently deployed Cloudflare Worker that
 does nothing but trigger the workflow on time (see below); it contains no scraping logic.
 
 The directory is still named `vox_cinema` for historical reasons; it now watches both VOX Cinemas
-Egypt and Scene Cinemas District 5.
+Egypt and Scene Cinemas at District 5 and Cairo Festival City.
 
 ## Commands
 
@@ -19,7 +19,7 @@ Egypt and Scene Cinemas District 5.
 pip install -r requirements.txt pytest   # deps; python-dotenv optional, only for the helper scripts
 pytest -q                                # full suite (tests/test_check_showtimes.py)
 pytest -q -k vox                         # single test / group by name substring
-python check_showtimes.py                # live run of every watch; WILL send Telegram + write state.json
+python check_showtimes.py                # live run of every Watch; WILL send Alerts + write state.json
 WATCHES_FILE=/tmp/scratch.json python check_showtimes.py   # dry-run against a scratch watch config
 python send_test_message.py              # one sample alert per watch (real wording), TEST-bannered
 python send_test_message.py <watch-id>   # ...or just one watch
@@ -92,10 +92,20 @@ Load-bearing details that aren't obvious from the code:
   The Worker needs a fine-grained PAT with **Actions: write** on this repo only, stored via
   `wrangler secret put`. Expect duplicate runs occasionally (Worker + fallback); `state.json`
   dedupes them.
-- **State is committed back to the repo.** `state.json` maps `{watch_id: "YYYYMMDD"}`; the workflow
-  commits it after a notification. That's the dedupe mechanism. `load_state` migrates the legacy
+- **State is committed back to the repo.** `state.json` stores Date watch keys under `notified_for`
+  as `{watch_id: "YYYYMMDD"}` and Movie watch identities under `movie_alerted` as
+  `{watch_id: {identity: "YYYYMMDD"}}`. Past Movie watch dates are pruned; New Showtime identities
+  are recorded only after delivery. The workflow commits state after changes. That's the dedupe mechanism. `load_state` migrates the legacy
   flat-string form onto the first watch. A watch's `id` *is* its dedupe key — renaming an id
   re-arms that watch. Expect `main` to receive bot commits, so pull before pushing.
+- **Movie watch discovery and identity matter.** VOX's cinema-less movie showtimes page supplies
+  the date picker; each date page lists Cinemas, filtered after parsing. VOX `data-id` is the
+  Showtime identity even when Not bookable. Scene discovers dates per Cinema; its identity combines
+  Cinema, date, time and Experience. `SCENE_CINEMAS` maps `district-5` and
+  `cairo-festival-city` to their URLs and names; a Scene Date watch defaults to District 5.
+- **Discord mentions are restricted.** The webhook sender sets `allowed_mentions` to the Watch's
+  listed users, disabling role and everyone mentions. Alerts use each Watch's Channels, defaulting
+  to both; a failed Channel causes a retry and may duplicate delivery to a successful Channel.
 - **Scene parsing keys off `ex_*` classes.** Experience groups are `<span class="ex_imax|ex_vip|
   ex_stand">` labels; `ex_*_content` wrappers are excluded so only label spans match. Sold out =
   `showtime_soldout` class or a `javascript:` href.
@@ -104,7 +114,8 @@ Load-bearing details that aren't obvious from the code:
 
 `tests/` covers the pure functions: date resolution (frozen clocks, never `datetime.now`), both
 parsers against saved HTML in `tests/fixtures/`, URL building, `watches.json` validation, and state
-migration. Network, Telegram, and state writes are untested by design.
+migration, Movie watch discovery, dedupe, pruning, Channels, and sample Alerts. Real network,
+Telegram/Discord delivery, and the workflow state commit are untested by design.
 `test_repo_watches_file_is_valid` asserts the committed `watches.json` actually loads and still
 contains the Odyssey watch — it guards production config, so don't relax it.
 

@@ -21,6 +21,14 @@
       "cinema_slug": "city-centre-almaza",
       "target": { "date": "2026-10-29" },
       "notify_on": "bookable"
+    },
+    {
+      "id": "avengers-doomsday",
+      "movie": {
+        "vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
+        "scene": []
+      },
+      "cinemas": "all"
     }
   ]
 }

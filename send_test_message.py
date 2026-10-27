@@ -25,10 +25,12 @@ from datetime import date, timedelta
 from check_showtimes import (
     SITES,
     Alert,
+    MovieWatch,
     Showtime,
     Watch,
     title_from_slug,
     build_alert,
+    format_movie_message,
     load_config,
     load_watches,
     resolve_target_date,
@@ -77,6 +79,34 @@ def sample_date(watch: Watch) -> date:
     return target if target >= date.today() else date.today() + timedelta(days=3)
 
 
+
+def sample_movie_alert(watch: MovieWatch, today: date) -> Alert:
+    """Build a plausible Movie watch Alert with the production formatter."""
+    booking = "https://egy.voxcinemas.com/booking/0047-sample"
+    groups = {
+        "City Centre Almaza": {
+            today + timedelta(days=3): {
+                "Standard": [Showtime(time="1:45pm", href=f"{booking}1"),
+                             Showtime(time="5:00pm", href=f"{booking}2")],
+                "GOLD": [Showtime(time="8:00pm", href=f"{booking}3")],
+            },
+        },
+        "Mall of Egypt": {
+            today + timedelta(days=4): {
+                "IMAX": [Showtime(time="7:30pm", href=f"{booking}4")],
+            },
+        },
+    }
+    slug = next(slug for slugs in watch.movie.values() for slug in slugs)
+    texts = {}
+    for channel in watch.channels:
+        text = format_movie_message(channel, title_from_slug(slug), groups, 4)
+        if channel == "discord" and watch.mention:
+            text = " ".join(f"<@{uid}>" for uid in watch.mention) + "\n" + text
+        texts[channel] = text
+    return Alert(texts=texts, mentions=list(watch.mention))
+
+
 def main(argv: "list[str]") -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -93,24 +123,26 @@ def main(argv: "list[str]") -> int:
     cfg = load_config(watches, os.environ)
     failures = []
     for watch in watches:
-        site = SITES[watch.site]
-        headline = "is now bookable!" if watch.notify_on == "bookable" else "showtimes are live!"
-        alert = build_alert(
-            watch=watch,
-            movie=title_from_slug(watch.movie_slug),
-            cinema=(title_from_slug(watch.cinema_slug) if watch.cinema_slug
-                    else site.default_cinema or watch.site.title()),
-            target=sample_date(watch),
-            groups=sample_groups(watch),
-            soldout_label=site.soldout_label,
-            headline=headline,
-        )
+        if isinstance(watch, MovieWatch):
+            alert = sample_movie_alert(watch, date.today())
+        else:
+            site = SITES[watch.site]
+            headline = "is now bookable!" if watch.notify_on == "bookable" else "showtimes are live!"
+            alert = build_alert(
+                watch=watch,
+                movie=title_from_slug(watch.movie_slug),
+                cinema=(title_from_slug(watch.cinema_slug) if watch.cinema_slug
+                        else site.default_cinema or watch.site.title()),
+                target=sample_date(watch),
+                groups=sample_groups(watch),
+                soldout_label=site.soldout_label,
+                headline=headline,
+            )
         texts = {}
         for channel, text in alert.texts.items():
             banner = BANNER if channel == "telegram" else BANNER.replace("<b>", "**").replace("</b>", "**")
             texts[channel] = banner + "\n\n" + text
-        log.info("[%s] sending sample (notify_on=%s) to %s",
-                 watch.id, watch.notify_on, ", ".join(texts))
+        log.info("[%s] sending sample to %s", watch.id, ", ".join(texts))
         try:
             send_alert(cfg, Alert(texts=texts, mentions=alert.mentions))
         except Exception as exc:  # noqa: BLE001 — keep trying the other Watches

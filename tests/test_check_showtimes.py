@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from check_showtimes import (  # noqa: E402
     SITES,
     Showtime,
+    MovieWatch,
     Watch,
     format_message,
     load_config,
@@ -238,10 +239,17 @@ def test_repo_watches_file_is_valid():
     assert odyssey.site == "scene"
     assert odyssey.notify_on == "published", "Odyssey's original trigger must not change"
 
+    avengers = by_id["avengers-doomsday"]
+    assert isinstance(avengers, MovieWatch)
+    assert avengers.movie == {"vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
+                              "scene": []}
+    assert avengers.cinemas == "all"
+    assert avengers.channels == ["telegram", "discord"]
+
     # The VOX watches are fixed-date and get retired once their date passes, so
     # assert their shape rather than any one date — pinning a specific date here
     # fails the suite the moment a spent watch is cleaned out of watches.json.
-    vox = [w for w in watches if w.site == "vox"]
+    vox = [w for w in watches if isinstance(w, Watch) and w.site == "vox"]
     assert vox, "at least one VOX watch must stay configured"
     for w in vox:
         assert w.cinema_slug, f"{w.id}: VOX watches require a cinema_slug"
@@ -1247,3 +1255,18 @@ def test_run_movie_watch_prunes_past_dated_scene_identities(tmp_path):
     kept = proposed["movie_alerted"]["avengers"]
     assert "scene:district-5:20261027:08:00 PM:Standard" not in kept
     assert "scene:district-5:20261029:08:00 PM:Standard" in kept
+
+
+def test_sample_movie_alert_uses_watch_channels_and_mentions():
+    from send_test_message import sample_movie_alert
+
+    watch = MovieWatch(id="sample", movie={"vox": ["avengers-doomsday"]},
+                       timezone="Africa/Cairo", channels=["discord"], mention=["123"])
+    alert = sample_movie_alert(watch, date(2026, 12, 13))
+    assert set(alert.texts) == {"discord"}
+    assert alert.mentions == ["123"]
+    text = alert.texts["discord"]
+    assert "<@123>" in text and "4 New Showtimes" in text
+    assert "City Centre Almaza" in text and "Mall of Egypt" in text
+    assert "December 16, 2026" in text and "December 17, 2026" in text
+    assert "Standard" in text and "IMAX" in text and "https://" in text
