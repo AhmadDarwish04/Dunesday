@@ -781,6 +781,15 @@ def parse_listing_vox(html: str) -> list[tuple[str, str]]:
     return list(movies.items())
 
 
+class SeatMapUnavailable(Exception):
+    """VOX says the seating plan is temporarily unavailable: unknown, not a failure."""
+
+
+# VOX prepares a seat map asynchronously; under load it has taken ~20s to be ready.
+SEAT_MAP_POLLS = 15
+SEAT_MAP_POLL_DELAY = 3
+
+
 def vox_read_seats(st: Showtime, category: str, fetch) -> Optional[list[str]]:
     """Read a guest seat map with cookies; GET only, never select or hold seats."""
     with fetch.session() as get:
@@ -798,21 +807,23 @@ def vox_read_seats(st: Showtime, category: str, fetch) -> Optional[list[str]]:
         get(base + "/seats/fetch", VOX_HEADERS)
         xhr = {**VOX_HEADERS, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json",
                "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"}
-        for _ in range(5):
+        for _ in range(SEAT_MAP_POLLS):
             if fetch.sleep is not None:
-                fetch.sleep(2)
+                fetch.sleep(SEAT_MAP_POLL_DELAY)
             response = get(base + "/seats/processing?json=1", xhr, delay=0)
             data = json.loads(response.body)["data"]
             if data.get("status") == 1 and data.get("url"):
                 response = get(urljoin(base, data["url"]), VOX_HEADERS)
                 break
         else:
-            raise RuntimeError("VOX seat processing never ready after 5 polls")
+            raise RuntimeError(f"VOX seat processing never ready after {SEAT_MAP_POLLS} polls")
     soup = BeautifulSoup(response.body, "html.parser")
     # A full house gets a message page instead of a seating plan: no seats free.
     message = soup.select_one("#seats .message.error")
     if message and "sold out" in message.get_text(" ").casefold():
         return []
+    if message and "currently unavailable" in message.get_text(" ").casefold():
+        raise SeatMapUnavailable(st.identity)
     if not soup.select_one(".seating-plan td.seat:not(.blank)"):
         raise ValueError("Unparseable VOX seat map")
     seat_class = {"regular": "standard"}.get(category.casefold(), category.casefold())
@@ -1380,6 +1391,9 @@ def run_seat_watch(watch: SeatWatch, fetch, state: dict, now: datetime) -> Watch
                     elif st.identity not in fired:
                         alerts.append(seat_alert(watch, movie, target, st, labels))
                         fired.append(st.identity)
+                except SeatMapUnavailable:
+                    log.info("[%s] %s: seating plan temporarily unavailable - retrying next run",
+                             watch.id, st.identity)
                 except Exception as exc:
                     failures.append(f"{st.href}: {exc}")
                     log.error("[%s] failed: %s", watch.id, failures[-1])

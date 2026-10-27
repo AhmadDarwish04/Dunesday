@@ -12,6 +12,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from check_showtimes import (  # noqa: E402
+    SEAT_MAP_POLLS,
+    SEAT_MAP_POLL_DELAY,
     SITES,
     Showtime,
     MovieWatch,
@@ -1709,8 +1711,8 @@ def test_seat_watch_bad_map_isolated_without_clearing_fired_state(tmp_path, fixt
     assert not alerts and proposed == state and len(failures) == 1
     if not ready:
         assert "never ready" in failures[0]
-        assert sleeps.count(2) == 5
-        assert len([u for u in fetch.calls if "?json=1" in u]) == 5
+        assert sleeps.count(SEAT_MAP_POLL_DELAY) == SEAT_MAP_POLLS
+        assert len([u for u in fetch.calls if "?json=1" in u]) == SEAT_MAP_POLLS
     else:
         assert "Unparseable" in failures[0]
 
@@ -1826,7 +1828,7 @@ def test_seat_watch_paces_the_cookie_flow_and_skips_other_cinemas(tmp_path):
     pauses = []
     result = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW, sleep=pauses.append)
     assert not result.failures and fetch.flows == 1
-    assert pauses == [1, 1, 1, 2, 1]
+    assert pauses == [1, 1, 1, SEAT_MAP_POLL_DELAY, 1]
 
 
 def test_seat_watch_cinema_filter_uses_adapter_slug_mapping(tmp_path):
@@ -1998,3 +2000,13 @@ def test_seat_watch_continues_as_guest_from_login_choice_page(tmp_path):
     fetch = SeatFetch("vox_seats_2.html", login_choice=True)
     alerts, _, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
     assert not failures and len(alerts) == 1
+
+
+def test_seat_watch_temporarily_unavailable_plan_is_skipped_without_failure_or_state(tmp_path, caplog):
+    watch = _seat_watch(tmp_path)
+    state = {"notified_for": {}, "seat_alerted": {"seats": ["0047-276744"]}}
+    with caplog.at_level("INFO"):
+        alerts, proposed, failures = run_watch(watch, SeatFetch("vox_seats_unavailable.html"), state, MOVIE_NOW)
+    assert not alerts and not failures
+    assert proposed == state  # neither re-armed nor fired: we simply don't know yet
+    assert "temporarily unavailable" in caplog.text
