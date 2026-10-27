@@ -240,6 +240,16 @@ def test_repo_watches_file_is_valid():
     assert avengers.match == {"scene": ["doomsday"], "vox": ["doomsday"]}
     assert avengers.cinemas == "all"
     assert avengers.channels == ["telegram", "discord"]
+    from check_showtimes import SeatWatch
+    seats = by_id["avengers-almaza-premium"]
+    assert isinstance(seats, SeatWatch)
+    assert seats.site == "vox" and seats.cinema_slug == "city-centre-almaza"
+    assert seats.movie == {"vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"]}
+    assert seats.match == {"vox": ["doomsday"]}
+    assert seats.start_date == date(2026, 12, 16) and seats.end_date == date(2026, 12, 18)
+    assert seats.earliest == "18:00" and seats.category == "Premium" and seats.min_free == 2
+    assert seats.channels == ["telegram", "discord"]
+
 
     # The VOX watches are fixed-date and get retired once their date passes, so
     # assert their shape rather than any one date — pinning a specific date here
@@ -1416,6 +1426,8 @@ def test_run_movie_match_vox_merges_slugs_and_evaluates_new_showtimes(tmp_path, 
                          match={"vox": ["doomsday"]}, cinemas=["city-centre-almaza"], mention=["123"])
     pages = {**_listing_pages_vox(), **_movie_pages(),
              "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday": "vox_no_showtimes.html"}
+    pages.update({f"https://egy.voxcinemas.com/showtimes?m=avengers-doomsday&d=202612{day}":
+                  "vox_doomsday_empty_discovery.html" for day in range(16, 24)})
     calls = []
     fetch_fixture = _fixture_fetch(pages)
     def fetch(url, headers):
@@ -1544,3 +1556,375 @@ def test_run_movie_match_vox_showtimes_filter_is_a_listing_source(tmp_path):
     assert len(alerts) == 2
     assert state["movie_listed"][watch.id] == ["vox:site:avengers-doomsday-infinity-vision"]
     assert "82 New Showtimes" in alerts[-1].texts["telegram"]
+
+# Seat watches exercise the whole read-only booking flow through run_watch.
+def _seat_watch(tmp_path, **extra):
+    entry = {"id": "seats", "kind": "seat", "site": "vox",
+             "movie": {"vox": ["avengers-doomsday-infinity-vision"]},
+             "cinema_slug": "city-centre-almaza", "dates": {"from": "2026-12-17", "to": "2026-12-17"},
+             "from": "18:00", "category": "Premium", "min_free": 2, **extra}
+    return load_watches(_write_watches(tmp_path, [entry]))[0]
+
+
+class SeatFetch:
+    def __init__(self, fixture="vox_seats_2.html", *, ready=True, pages=None):
+        self.pages = pages or {**_movie_pages(), MOVIE_URL + "&d=20261217": "vox_seat_showtimes.html"}
+        self.fixture = fixture
+        self.ready = ready
+        self.calls = []
+        self.flows = 0
+
+    def __call__(self, url, headers):
+        return _fixture_fetch(self.pages)(url, headers)
+
+    def session(self):
+        from contextlib import contextmanager
+        from check_showtimes import FetchResponse
+        @contextmanager
+        def flow():
+            self.flows += 1
+            step = 0
+            def get(url, headers):
+                nonlocal step
+                self.calls.append(url)
+                base = "https://egy.voxcinemas.com/booking/e1e56d29-3949-4621-9867-576e412a1992_0047-276744"
+                if step == 0:
+                    assert url == "https://egy.voxcinemas.com/booking/0047-276744"
+                    result = FetchResponse(base + "/guest/processing", "")
+                elif step == 1:
+                    assert url == base + "/seats/fetch"
+                    result = FetchResponse(url, _read("vox_seats_fetch.html"))
+                elif "processing?json=1" in url:
+                    assert url == base + "/seats/processing?json=1"
+                    assert headers["X-Requested-With"] == "XMLHttpRequest"
+                    assert headers["Accept"] == "application/json"
+                    payload = json.loads(_read("vox_seats_processing.json"))
+                    if not self.ready:
+                        payload["data"] = {"status": 0}
+                    result = FetchResponse(url, json.dumps(payload))
+                else:
+                    expected = json.loads(_read("vox_seats_processing.json"))["data"]["url"]
+                    assert url == "https://egy.voxcinemas.com" + expected
+                    result = FetchResponse(url, _read(self.fixture))
+                step += 1
+                return result
+            yield get
+        return flow()
+
+
+def test_seat_watch_threshold_rearms_and_alerts_again(tmp_path):
+    watch = _seat_watch(tmp_path, mention=["123"])
+    state = {"notified_for": {"old": "20261028"}}
+    low = SeatFetch("vox_seats_1.html")
+    assert run_watch(watch, low, state, MOVIE_NOW, sleep=lambda _: None) == ([], state, ())
+    high = SeatFetch()
+    alerts, fired, failures = run_watch(watch, high, state, MOVIE_NOW, sleep=lambda _: None)
+    assert not failures and len(alerts) == 1
+    assert fired == {**state, "seat_alerted": {"seats": ["0047-276744"]}}
+    assert state == {"notified_for": {"old": "20261028"}}
+    for text in alerts[0].texts.values():
+        assert "2 Premium seats free" in text and "Avengers" in text
+        assert "K-20" in text and "K-19" in text and "K-18" not in text
+        assert "City Centre Almaza" in text and "December 17, 2026" in text
+        assert "7:30pm" in text and "IMAX" in text
+        assert "https://egy.voxcinemas.com/booking/0047-276744" in text
+    assert alerts[0].mentions == ["123"]
+    assert alerts[0].texts["discord"].startswith("<@123>\n")
+    assert run_watch(watch, high, fired, MOVIE_NOW) == ([], fired, ())
+    alerts, rearmed, failures = run_watch(watch, low, fired, MOVIE_NOW)
+    assert not alerts and not failures and rearmed["seat_alerted"] == {"seats": []}
+    assert len(run_watch(watch, high, rearmed, MOVIE_NOW).alerts) == 1
+
+@pytest.mark.parametrize("extra", [
+    {"site": "scene"}, {"cinema_slug": "missing"}, {"dates": {"from": "2026-12-18", "to": "2026-12-16"}},
+    {"dates": {}}, {"dates": None}, {"from": "6:00pm"}, {"from": "24:00"},
+    {"category": ""}, {"category": 1}, {"min_free": 0}, {"min_free": True}, {"min_free": "2"},
+    {"movie": {"scene": ["m"]}}, {"target": {"date": "2026-12-17"}},
+    {"movie": {}, "match": []}, {"movie": {"vox": []}}, {"movie": []},
+])
+def test_seat_watch_rejects_invalid_config(tmp_path, extra):
+    with pytest.raises(RuntimeError):
+        _seat_watch(tmp_path, **extra)
+
+
+def test_seat_watch_match_only_and_case_insensitive_categories(tmp_path):
+    watch = _seat_watch(tmp_path, movie={}, match=["doomsday"], category="pReMiUm")
+    fetch = SeatFetch(pages={**_listing_pages_vox(), **_movie_pages(),
+        MOVIE_URL + "&d=20261217": "vox_seat_showtimes.html",
+        "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday": "vox_no_showtimes.html",
+        "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday&d=20261217": "vox_doomsday_empty_discovery.html"})
+    alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
+    assert not failures and len(alerts) == 1 and fetch.flows == 1
+    assert set(state) == {"notified_for", "seat_alerted"}
+
+
+@pytest.mark.parametrize("extra", [
+    {"from": "19:31"}, {"cinema_slug": "city-centre-alexandria", "from": "23:59"},
+    {"dates": {"from": "2026-12-24", "to": "2026-12-25"}},
+])
+def test_seat_watch_filters_without_reading_excluded_seat_maps(tmp_path, extra):
+    watch = _seat_watch(tmp_path, **extra)
+    fetch = SeatFetch(pages={**_movie_pages(),
+        MOVIE_URL + "&d=20261217": "vox_seat_showtimes.html",
+        MOVIE_URL + "&d=20261224": "vox_doomsday_empty_discovery.html",
+        MOVIE_URL + "&d=20261225": "vox_doomsday_empty_discovery.html"})
+    state = {"notified_for": {}}
+    assert run_watch(watch, fetch, state, MOVIE_NOW) == ([], state, ())
+    assert fetch.flows == 0
+
+
+def test_seat_watch_not_bookable_skipped_and_category_absent_logged(tmp_path, caplog):
+    watch = _seat_watch(tmp_path, category="Gold")
+    fetch = SeatFetch()
+    import logging
+    with caplog.at_level(logging.INFO):
+        assert run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW) == ([], {"notified_for": {}}, ())
+    assert fetch.flows == 1  # Other times are Not bookable; no fake flow exists for them.
+    assert "Seat category Gold absent" in caplog.text
+
+
+@pytest.mark.parametrize("fixture,ready", [("vox_seats_2.html", False), ("vox_no_showtimes.html", True)])
+def test_seat_watch_bad_map_isolated_without_clearing_fired_state(tmp_path, fixture, ready):
+    watch = _seat_watch(tmp_path)
+    fetch = SeatFetch(fixture, ready=ready)
+    sleeps = []
+    state = {"notified_for": {}, "seat_alerted": {"seats": ["0047-276744"]}}
+    alerts, proposed, failures = run_watch(watch, fetch, state, MOVIE_NOW, sleep=sleeps.append)
+    assert not alerts and proposed == state and len(failures) == 1
+    if not ready:
+        assert "never ready" in failures[0]
+        assert sleeps.count(2) == 5
+        assert len([u for u in fetch.calls if "?json=1" in u]) == 5
+    else:
+        assert "Unparseable" in failures[0]
+
+
+def test_seat_watch_regular_alias_caps_labels_and_preserves_other_state(tmp_path):
+    watch = _seat_watch(tmp_path, category="Regular")
+    initial = {"notified_for": {}, "movie_alerted": {"old": {}}, "movie_listed": {"old": ["listed"]}}
+    alerts, state, failures = run_watch(watch, SeatFetch("vox_seats_0.html"), initial, MOVIE_NOW)
+    assert not failures and len(alerts) == 1
+    assert "88 Regular seats free" in alerts[0].texts["telegram"]
+    assert "…" in alerts[0].texts["telegram"]
+    assert state["movie_listed"] == initial["movie_listed"]
+
+
+def test_seat_watch_deduplicates_variants_and_inclusive_start_time(tmp_path):
+    watch = _seat_watch(tmp_path, movie={"vox": ["avengers-doomsday-infinity-vision", "avengers-doomsday"]},
+                        **{"from": "19:30"})
+    pages = {**_movie_pages(), **_movie_pages(slug="avengers-doomsday")}
+    for slug in watch.movie["vox"]:
+        pages[f"https://egy.voxcinemas.com/showtimes?m={slug}&d=20261217"] = "vox_seat_showtimes.html"
+    fetch = SeatFetch(pages=pages)
+    alerts, _, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
+    assert not failures and len(alerts) == 1 and fetch.flows == 1
+
+@pytest.mark.parametrize("mode", ["rearm", "delivered", "delivery_failed", "processing_failed", "unchanged"])
+def test_main_seat_watch_delivery_state_and_failure_exit(tmp_path, monkeypatch, mode):
+    import check_showtimes as notifier
+    watch = _seat_watch(tmp_path, channels=["telegram"])
+    monkeypatch.setattr(notifier, "load_watches", lambda *args: [watch])
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
+    state_path = tmp_path / "state.json"
+    initial = {"notified_for": {"old": "20261028"}, "seat_alerted": {"seats": (
+        ["0047-276744"] if mode in ("rearm", "processing_failed") else [])}}
+    state_path.write_text(json.dumps(initial), encoding="utf-8")
+    monkeypatch.setattr(notifier, "DEFAULT_STATE_PATH", state_path)
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return MOVIE_NOW.astimezone(tz)
+    monkeypatch.setattr(notifier, "datetime", FrozenDatetime)
+    monkeypatch.setattr(notifier.time, "sleep", lambda _: None)
+    fetch = SeatFetch("vox_seats_1.html" if mode in ("rearm", "unchanged") else "vox_seats_2.html",
+                      ready=mode != "processing_failed")
+    monkeypatch.setattr(notifier, "fetch_page", fetch)
+    monkeypatch.setattr(notifier, "booking_session", fetch.session)
+    delivered = []
+    def send(*args):
+        if mode == "delivery_failed":
+            raise RuntimeError("delivery failed")
+        delivered.append(args[-1])
+    monkeypatch.setattr(notifier, "send_telegram", send)
+    if mode == "unchanged":
+        monkeypatch.setattr(notifier, "save_state", lambda *args: pytest.fail("unchanged state written"))
+    assert notifier.main() == int(mode in ("delivery_failed", "processing_failed"))
+    saved = load_state(state_path)
+    if mode == "unchanged":
+        assert saved == initial and not delivered
+    elif mode in ("delivery_failed", "processing_failed"):
+        assert saved == initial
+    else:
+        assert saved["seat_alerted"]["seats"] == ([] if mode == "rearm" else ["0047-276744"])
+        assert len(delivered) == int(mode == "delivered")
+
+
+def test_sample_seat_alert_uses_production_format_and_channels(tmp_path):
+    from send_test_message import sample_seat_alert
+    watch = _seat_watch(tmp_path, channels=["discord"], mention=["123"])
+    alert = sample_seat_alert(watch)
+    assert set(alert.texts) == {"discord"}
+    assert alert.mentions == ["123"]
+    assert "2 Premium seats free" in alert.texts["discord"]
+    assert "City Centre Almaza" in alert.texts["discord"]
+    assert "K-20, K-19" in alert.texts["discord"]
+
+@pytest.mark.parametrize("movie", [None, 1, "avengers"])
+def test_seat_watch_rejects_malformed_movie_map(tmp_path, movie):
+    with pytest.raises(RuntimeError, match="movie must"):
+        _seat_watch(tmp_path, movie=movie)
+
+
+def test_seat_watch_keeps_successful_showtime_when_another_seat_read_fails(tmp_path):
+    watch = _seat_watch(tmp_path)
+    pages = _movie_pages()
+    html = _read("vox_seat_showtimes.html").replace(
+        '<span class="action showtime unavailable" data-id="0047-276773">10:30pm </span>',
+        '<a class="action showtime" href="/booking/0047-276773">11:00pm</a>')
+    # The fake has no valid seat flow for 276773: its failure must remain isolated.
+    fetch = SeatFetch(pages=pages)
+    base_fetch = fetch.__call__
+    class PagesWithSecondShowtime(SeatFetch):
+        def __call__(self, url, headers):
+            return html if url == MOVIE_URL + "&d=20261217" else base_fetch(url, headers)
+    fetch = PagesWithSecondShowtime(pages=pages)
+    alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
+    assert len(alerts) == 1 and len(failures) == 1
+    assert "276773" in failures[0]
+    assert state["seat_alerted"] == {"seats": ["0047-276744"]}
+
+
+def test_seat_watch_paces_the_cookie_flow_and_skips_other_cinemas(tmp_path):
+    watch = _seat_watch(tmp_path)
+    # All other Cinemas have bookable times, but no valid fake seat flow.
+    fetch = SeatFetch()
+    pauses = []
+    result = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW, sleep=pauses.append)
+    assert not result.failures and fetch.flows == 1
+    assert pauses == [1, 1, 1, 2, 1]
+
+
+def test_seat_watch_cinema_filter_uses_adapter_slug_mapping(tmp_path):
+    watch = _seat_watch(tmp_path)
+    # Captured seat flow remains valid, but the selected Showtime belongs to another Cinema.
+    page = _read("vox_seat_showtimes.html").replace("City Centre Almaza", "Mall of Egypt")
+    class DifferentCinema(SeatFetch):
+        def __call__(self, url, headers):
+            return page if url == MOVIE_URL + "&d=20261217" else super().__call__(url, headers)
+    fetch = DifferentCinema()
+    state = {"notified_for": {}}
+    assert run_watch(watch, fetch, state, MOVIE_NOW) == ([], state, ())
+    assert fetch.flows == 0
+
+DOOMSDAY_URL = "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday"
+
+
+@pytest.mark.parametrize("missing_picker_first", [False, True])
+def test_movie_watch_uses_other_slugs_dates_when_discovery_has_no_picker(tmp_path, caplog, missing_picker_first):
+    slugs = ["avengers-doomsday-infinity-vision", "avengers-doomsday"]
+    if missing_picker_first:
+        slugs.reverse()
+    watch = _movie_watch(tmp_path, movie={"vox": slugs})
+    pages = {**_movie_pages(), DOOMSDAY_URL: "vox_doomsday_empty_discovery.html",
+             **{f"{DOOMSDAY_URL}&d=202612{day}": "vox_doomsday_empty_discovery.html" for day in range(16, 24)}}
+    pages[DOOMSDAY_URL + "&d=20261217"] = "vox_doomsday_dated_no_picker.html"
+    calls = []
+    def fetch(url, headers):
+        calls.append(url)
+        return _fixture_fetch(pages)(url, headers)
+    alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
+    assert not failures
+    assert "0047-276744" in state["movie_alerted"][watch.id]
+    assert len(alerts) == 1
+    assert alerts[0].texts["telegram"].count("booking/0047-276744") == 1
+    assert DOOMSDAY_URL + "&d=20261216" in calls
+    assert len(calls) == len(set(calls))
+    assert "page structure may have changed" not in caplog.text
+
+
+@pytest.mark.parametrize("with_other_slug", [False, True])
+def test_seat_watch_reads_dated_showtimes_without_discovery_picker(tmp_path, with_other_slug):
+    from bs4 import BeautifulSoup
+    slugs = ["avengers-doomsday"] + (["avengers-doomsday-infinity-vision"] if with_other_slug else [])
+    watch = _seat_watch(tmp_path, movie={"vox": slugs})
+    # Derived from the live dated page: mark the 11pm Showtime Not bookable so the
+    # test reads only the IMAX seat map captured for 7:30pm (0047-276744).
+    soup = BeautifulSoup(_read("vox_doomsday_dated_no_picker.html"), "html.parser")
+    late = soup.select_one('li[data-id="0047-276745"] .action.showtime')
+    late.name = "span"
+    late.attrs.pop("href", None)
+    late["class"].append("unavailable")
+    for current in soup.select("input[name=d]"):
+        current.decompose()
+    html = "<!-- DERIVED: 0047-276745 Not bookable; hidden date input removed. -->\n" + str(soup)
+    class NoPickerFetch(SeatFetch):
+        def __init__(self):
+            super().__init__()
+            self.page_calls = []
+        def __call__(self, url, headers):
+            self.page_calls.append(url)
+            if url == DOOMSDAY_URL:
+                return _read("vox_doomsday_empty_discovery.html")
+            if url == DOOMSDAY_URL + "&d=20261217":
+                return html
+            return super().__call__(url, headers)
+    fetch = NoPickerFetch()
+    alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
+    assert not failures and len(alerts) == 1
+    assert fetch.flows == 1
+    assert DOOMSDAY_URL + "&d=20261217" in fetch.page_calls
+    assert len(fetch.page_calls) == len(set(fetch.page_calls))
+    assert state["seat_alerted"] == {watch.id: ["0047-276744"]}
+
+@pytest.mark.parametrize("failed_page", [False, True])
+def test_movie_watch_shared_candidate_pages_fetched_once_across_watches(tmp_path, failed_page):
+    from check_showtimes import PacedFetch
+    watch = _movie_watch(tmp_path, movie={"vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"]})
+    pages = {**_movie_pages(), DOOMSDAY_URL: "vox_doomsday_empty_discovery.html",
+             **{f"{DOOMSDAY_URL}&d=202612{day}": "vox_doomsday_empty_discovery.html" for day in range(16, 24)}}
+    pages[DOOMSDAY_URL + "&d=20261217"] = "vox_doomsday_dated_no_picker.html"
+    calls = []
+    def fetch(url, headers):
+        calls.append(url)
+        if failed_page and url == DOOMSDAY_URL + "&d=20261218":
+            raise RuntimeError("dated page failed")
+        return _fixture_fetch(pages)(url, headers)
+    paced = PacedFetch(fetch)
+    initial = {"notified_for": {}}
+    first = run_watch(watch, paced, initial, MOVIE_NOW)
+    # Simulate the same Site/movie pages needed by another Watch in this run.
+    other = _movie_watch(tmp_path, id="other", movie=watch.movie)
+    second = run_watch(other, paced, first.state, MOVIE_NOW)
+    assert bool(first.failures) is failed_page and bool(second.failures) is failed_page
+    assert "0047-276744" in first.state["movie_alerted"][watch.id]
+    assert "0047-276744" in second.state["movie_alerted"][other.id]
+    assert len(calls) == len(set(calls))
+    # This MAX Showtime appears in both slugs' dated pages but alerts once.
+    assert first.alerts[0].texts["telegram"].count("booking/0028-568252") == 1
+    assert initial == {"notified_for": {}}
+
+
+def test_seat_watch_fallback_range_starts_today_and_includes_end(tmp_path, caplog):
+    watch = _seat_watch(tmp_path, movie={"vox": ["avengers-doomsday"]},
+        dates={"from": "2026-12-16", "to": "2026-12-18"}, **{"from": "23:59"})
+    pages = {DOOMSDAY_URL: "vox_doomsday_empty_discovery.html",
+             DOOMSDAY_URL + "&d=20261217": "vox_doomsday_dated_no_picker.html",
+             DOOMSDAY_URL + "&d=20261218": "vox_doomsday_empty_discovery.html"}
+    calls = []
+    def fetch(url, headers):
+        calls.append(url)
+        return _fixture_fetch(pages)(url, headers)
+    now = datetime(2026, 12, 16, 22, tzinfo=ZoneInfo("UTC"))  # Dec 17 in Cairo.
+    state = {"notified_for": {}}
+    assert run_watch(watch, fetch, state, now) == ([], state, ())
+    assert calls == [DOOMSDAY_URL, DOOMSDAY_URL + "&d=20261217", DOOMSDAY_URL + "&d=20261218"]
+    assert "page structure may have changed" not in caplog.text
+
+
+def test_seat_watch_sold_out_page_counts_as_no_free_seats_and_rearms(tmp_path):
+    watch = _seat_watch(tmp_path)
+    state = {"notified_for": {}, "seat_alerted": {"seats": ["0047-276744"]}}
+    alerts, proposed, failures = run_watch(watch, SeatFetch("vox_seats_soldout.html"), state, MOVIE_NOW)
+    assert not alerts and not failures
+    assert proposed["seat_alerted"]["seats"] == []

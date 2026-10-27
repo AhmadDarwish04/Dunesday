@@ -28,6 +28,8 @@ from check_showtimes import (
     watch_defaults,
     Alert,
     MovieWatch,
+    SeatWatch,
+    seat_alert,
     Showtime,
     Watch,
     title_from_slug,
@@ -108,6 +110,16 @@ def sample_movie_alert(watch: MovieWatch, today: date) -> Alert:
     return Alert(texts=texts, mentions=list(watch.mention))
 
 
+def sample_seat_alert(watch: SeatWatch) -> Alert:
+    """Use the real seat formatter with clearly synthetic seat labels/booking identity."""
+    slug = next((slug for slugs in watch.movie.values() for slug in slugs), "")
+    movie = title_from_slug(slug or " ".join(next(iter(watch.match.values()))))
+    st = Showtime(time=watch.earliest, href="https://egy.voxcinemas.com/booking/0047-sample",
+                  cinema=SITES[watch.site].cinema_names[watch.cinema_slug], experience="IMAX")
+    labels = ["K-20", "K-19"] + [f"Sample-{i}" for i in range(3, watch.min_free + 1)]
+    return seat_alert(watch, movie, watch.start_date, st, labels[:watch.min_free])
+
+
 def main(argv: "list[str]") -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -124,7 +136,9 @@ def main(argv: "list[str]") -> int:
     cfg = load_config(watches, os.environ)
     failures = []
     for watch in watches:
-        if isinstance(watch, MovieWatch):
+        if isinstance(watch, SeatWatch):
+            alert = sample_seat_alert(watch)
+        elif isinstance(watch, MovieWatch):
             alert = sample_movie_alert(watch, date.today())
         else:
             site = SITES[watch.site]

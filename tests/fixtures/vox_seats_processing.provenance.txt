@@ -1,0 +1,1 @@
+Live curl_cffi GET https://egy.voxcinemas.com/booking/b79a8436-2041-46af-aac7-d5542549d66c_0047-276744/seats/processing?json=1 ; 2026-10-28

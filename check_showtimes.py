@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from functools import partial
@@ -138,6 +139,23 @@ class MovieWatch:
 
 
 @dataclass(frozen=True)
+class SeatWatch(MovieWatch):
+    """Selected Showtimes whose Seat category crosses a free-seat threshold."""
+    site: str = ""
+    cinema_slug: str = ""
+    start_date: date = date.min
+    end_date: date = date.max
+    earliest: str = "18:00"
+    category: str = "Premium"
+    min_free: int = 2
+
+
+class FetchResponse(NamedTuple):
+    url: str
+    body: str
+
+
+@dataclass(frozen=True)
 class Showtime:
     """A single showtime entry parsed from the page."""
     time: str
@@ -197,6 +215,8 @@ class Site:
     listing_sources: Callable[[str | list[str]], list[ListingPage]] = lambda cinemas: []
     parse_listing: Callable[[str], list[tuple[str, str]]] = lambda html: []
     listing_headers: dict = field(default_factory=dict)
+
+    read_seats: Optional[Callable] = None
 
     @property
     def default_cinema(self) -> str:
@@ -274,6 +294,41 @@ def watch_defaults(env: Mapping[str, str]) -> tuple[Path, str]:
             (env.get("TIMEZONE") or "Africa/Cairo").strip())
 
 
+def parse_seat_settings(entry: dict, where: str) -> dict:
+    site = entry.get("site")
+    if site not in SITES or SITES[site].read_seats is None:
+        raise RuntimeError(f"{where}: Site does not support Seat watches")
+    cinema = entry.get("cinema_slug")
+    if cinema not in SITES[site].cinema_names:
+        raise RuntimeError(f"{where}: unknown Seat watch Cinema slug")
+    if any(key in entry for key in ("target", "movie_slug", "base_url", "notify_on", "cinemas", "until")):
+        raise RuntimeError(f"{where}: cannot mix Seat watch and other Watch shapes")
+    if not isinstance(entry.get("movie", {}), dict):
+        raise RuntimeError(f"{where}: movie must be a per-Site slug map")
+    if any(name != site for name in entry.get("movie", {})) or (
+            isinstance(entry.get("match"), dict) and any(name != site for name in entry["match"])):
+        raise RuntimeError(f"{where}: Seat watch movie/match must use only its Site")
+    try:
+        dates = entry["dates"]
+        start = date.fromisoformat(dates["from"])
+        end = date.fromisoformat(dates["to"])
+        if start > end:
+            raise ValueError()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{where}: dates need an inclusive YYYY-MM-DD from/to range") from exc
+    earliest = entry.get("from")
+    if not isinstance(earliest, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", earliest):
+        raise RuntimeError(f"{where}: from must be HH:MM (24-hour)")
+    category = entry.get("category")
+    if not isinstance(category, str) or not category.strip() or not re.fullmatch(r"[a-zA-Z]+", category.strip()):
+        raise RuntimeError(f"{where}: category must be a non-empty Seat category name")
+    minimum = entry.get("min_free")
+    if type(minimum) is not int or minimum < 1:
+        raise RuntimeError(f"{where}: min_free must be a positive integer")
+    return dict(site=site, cinema_slug=cinema, start_date=start, end_date=end,
+                earliest=earliest, category=category.strip(), min_free=minimum)
+
+
 def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Watch | MovieWatch]":
     """Parse and validate watches.json into Watch objects.
 
@@ -296,6 +351,15 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
             raise RuntimeError(f"{where}: duplicate id {wid!r}")
         seen.add(wid)
 
+        seat = None
+        if e.get("kind") == "seat":
+            seat = parse_seat_settings(e, where)
+            e = {key: value for key, value in e.items() if key not in ("site", "cinema_slug")}
+            e = {**e, "movie": e.get("movie", {}), "cinemas": [seat["cinema_slug"]]}
+            if isinstance(e.get("match"), list):
+                e["match"] = {seat["site"]: e["match"]}
+        elif "kind" in e:
+            raise RuntimeError(f"{where}: unknown Watch kind {e['kind']!r}")
         if "movie" in e:
             if any(key in e for key in ("site", "movie_slug", "cinema_slug", "target", "base_url", "notify_on")):
                 raise RuntimeError(f"{where}: cannot mix Date watch and Movie watch shapes")
@@ -339,8 +403,9 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
                 except (ValueError, AttributeError) as exc:
                     raise RuntimeError(f"{where}: until must be YYYY-MM-DD, got {e['until']!r}") from exc
             channels, mention = parse_channels_and_mentions(e, where)
-            watches.append(MovieWatch(id=wid, movie=movie, timezone=tz, cinemas=cinemas, until=until,
-                                      channels=channels, mention=mention, match=match))
+            cls = SeatWatch if seat else MovieWatch
+            watches.append(cls(id=wid, movie=movie, timezone=tz, cinemas=cinemas, until=until,
+                               channels=channels, mention=mention, match=match, **(seat or {})))
             continue
         if "cinemas" in e or "until" in e or "match" in e:
             raise RuntimeError(f"{where}: cannot mix Date watch and Movie watch shapes")
@@ -708,6 +773,44 @@ def parse_listing_vox(html: str) -> list[tuple[str, str]]:
     return list(movies.items())
 
 
+def vox_read_seats(st: Showtime, category: str, fetch) -> Optional[list[str]]:
+    """Read a guest seat map with cookies; GET only, never select or hold seats."""
+    with fetch.session() as get:
+        response = get(st.href, VOX_HEADERS)
+        if "/guest/processing" not in response.url:
+            raise ValueError("VOX booking did not reach guest/processing")
+        base = response.url.split("/guest/processing")[0]
+        get(base + "/seats/fetch", VOX_HEADERS)
+        xhr = {**VOX_HEADERS, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json",
+               "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"}
+        for _ in range(5):
+            if fetch.sleep is not None:
+                fetch.sleep(2)
+            response = get(base + "/seats/processing?json=1", xhr, delay=0)
+            data = json.loads(response.body)["data"]
+            if data.get("status") == 1 and data.get("url"):
+                response = get(urljoin(base, data["url"]), VOX_HEADERS)
+                break
+        else:
+            raise RuntimeError("VOX seat processing never ready after 5 polls")
+    soup = BeautifulSoup(response.body, "html.parser")
+    # A full house gets a message page instead of a seating plan: no seats free.
+    message = soup.select_one("#seats .message.error")
+    if message and "sold out" in message.get_text(" ").casefold():
+        return []
+    if not soup.select_one(".seating-plan td.seat:not(.blank)"):
+        raise ValueError("Unparseable VOX seat map")
+    seat_class = {"regular": "standard"}.get(category.casefold(), category.casefold())
+    seats = soup.select(f".seating-plan td.seat.{seat_class}:not(.blank)")
+    if not seats:
+        return None
+    free = [seat for seat in seats if "sold" not in seat.get("class", [])]
+    labels = [seat.select_one("label[title]") for seat in free]
+    if any(label is None or not label["title"].strip() for label in labels):
+        raise ValueError("Free seat is missing its label")
+    return [label["title"] for label in labels]
+
+
 SITES: "dict[str, Site]" = {
     "scene": Site(
         build_url=scene_url,
@@ -745,6 +848,7 @@ SITES: "dict[str, Site]" = {
         discovery_date=vox_discovery_date,
         discovery_empty_is_expected=vox_empty_is_expected,
         movie_title=vox_movie_title,
+        read_seats=vox_read_seats,
         cinema_names={
             "city-centre-alexandria": "City Centre Alexandria",
             "city-centre-almaza": "City Centre Almaza",
@@ -943,6 +1047,7 @@ def load_state(path: Path, watches: "Optional[list[Watch | MovieWatch]]" = None)
 
     `movie_alerted` maps Watch id to {Showtime identity: "YYYYMMDD"}.
     `movie_listed` maps Watch id to persistent Listed identities (Site: Cinema-or-site: slug).
+    `seat_alerted` maps Watch id to Showtime identities currently above their threshold.
 
     Older runs stored a single bare string for the one watch that existed then; that value
     is migrated onto the first watch so an already-sent notification isn't repeated.
@@ -951,7 +1056,7 @@ def load_state(path: Path, watches: "Optional[list[Watch | MovieWatch]]" = None)
         return {"notified_for": {}}
 
     state = json.loads(path.read_text(encoding="utf-8"))
-    movie_state = {key: state[key] for key in ("movie_alerted", "movie_listed") if key in state}
+    movie_state = {key: state[key] for key in ("movie_alerted", "movie_listed", "seat_alerted") if key in state}
     notified = state.get("notified_for")
     if isinstance(notified, dict):
         return {**movie_state, "notified_for": notified}
@@ -1003,10 +1108,36 @@ def discover_dates(watch: MovieWatch, site: Site, source: MoviePages, fetch) -> 
     return html, targets
 
 
+def discover_movie_dates(watch: MovieWatch, site: Site, selected: dict, fetch,
+                         failures: list, now: datetime):
+    """Discover all slugs first so a missing picker can use its same-Site peers."""
+    pages = []
+    candidates = set()
+    for slug, cinemas in selected.items():
+        for source in site.movie_sources(slug, cinemas):
+            try:
+                html, own_dates = discover_dates(watch, site, source, fetch)
+            except Exception as exc:
+                failure = f"{source.build_url(None)}: {exc}"
+                failures.append(failure)
+                log.error("[%s] failed: %s", watch.id, failure)
+                continue
+            pages.append((slug, source, html))
+            candidates.update(own_dates)
+    if isinstance(watch, SeatWatch):
+        first = max(now.date(), watch.start_date)
+        candidates.update(first + timedelta(days=offset)
+                          for offset in range((watch.end_date - first).days + 1))
+    targets = sorted(candidates)
+    for slug, source, html in pages:
+        yield slug, source, html, targets
+
+
 def fetch_showtimes(watch: MovieWatch, site: Site, source: MoviePages, fetch,
                     discovery: str, target: date) -> list[Showtime]:
     url = source.build_url(target)
-    html = discovery if target == site.discovery_date(discovery) else fetch(url, site.headers)
+    use_discovery = target == site.discovery_date(discovery) and target in site.movie_dates(discovery)
+    html = discovery if use_discovery else fetch(url, site.headers)
     showtimes = source.parse(html, target)
     if not showtimes and not site.empty_is_expected(html):
         warn_markup(watch.id, url)
@@ -1033,19 +1164,52 @@ def new_showtimes(showtimes: list[Showtime], alerted: dict, target: date) -> lis
     return new
 
 
+@contextmanager
+def booking_session():
+    """One curl_cffi cookie jar per seat-map read; responses retain redirect URLs."""
+    with cffi_requests.Session(impersonate="chrome124") as session:
+        def get(url, headers):
+            response = session.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            return FetchResponse(response.url, response.text)
+        yield get
+
+
 class PacedFetch:
     """Share the pause between page fetches across every Watch in a run."""
-    def __init__(self, fetch, sleep=None):
+    def __init__(self, fetch, sleep=None, session_factory=None):
         self.fetch = fetch
+        self.session_factory = session_factory or getattr(fetch, "session", None)
         self.sleep = sleep
         self.fetched = False
         self.listings = {}
+        self.pages = {}
+
+    def paced(self, get, url, headers, delay=1):
+        if self.fetched and self.sleep is not None and delay:
+            self.sleep(delay)
+        self.fetched = True
+        return get(url, headers)
 
     def __call__(self, url, headers):
-        if self.fetched and self.sleep is not None:
-            self.sleep(1)
-        self.fetched = True
-        return self.fetch(url, headers)
+        if url not in self.pages:
+            try:
+                self.pages[url] = self.paced(self.fetch, url, headers)
+            except Exception as exc:
+                self.pages[url] = exc
+        result = self.pages[url]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    @contextmanager
+    def session(self):
+        if self.session_factory is None:
+            raise RuntimeError("Seat map fetch requires an injected session factory")
+        with self.session_factory() as get:
+            # Polls already wait two seconds; every other request uses ordinary pacing.
+            yield lambda url, headers, delay=1: self.paced(get, url, headers, delay)
+
 
     def listing(self, url, headers):
         if url not in self.listings:
@@ -1120,29 +1284,22 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
         if watch.cinemas != "all" and not any(c in site.cinema_names for c in watch.cinemas):
             continue
         selected = matched_movies(watch, name, site, fetch, listed, alerts, failures)
-        for slug, cinemas in selected.items():
-            for source in site.movie_sources(slug, cinemas):
-                url = source.build_url(None)
-                try:
-                    discovery, targets = discover_dates(watch, site, source, fetch)
-                    if not movie:
-                        movie = site.movie_title(discovery, slug)
-                except Exception as exc:
-                    log.error("[%s] failed %s: %s", watch.id, url, exc)
-                    failures.append(f"{url}: {exc}")
+        for slug, source, discovery, targets in discover_movie_dates(
+                watch, site, selected, fetch, failures, now):
+            if not movie:
+                movie = site.movie_title(discovery, slug)
+            for target in targets:
+                if target < now.date():
                     continue
-                for target in targets:
-                    if target < now.date():
-                        continue
-                    date_url = source.build_url(target)
-                    try:
-                        showtimes = fetch_showtimes(watch, site, source, fetch, discovery, target)
-                        selected = filter_cinemas(watch, site, showtimes, date_url)
-                        for st in new_showtimes(selected, alerted, target):
-                            groups.setdefault(st.cinema, {}).setdefault(target, {}).setdefault(st.experience, []).append(st)
-                    except Exception as exc:
-                        log.error("[%s] failed %s: %s", watch.id, date_url, exc)
-                        failures.append(f"{date_url}: {exc}")
+                date_url = source.build_url(target)
+                try:
+                    showtimes = fetch_showtimes(watch, site, source, fetch, discovery, target)
+                    selected = filter_cinemas(watch, site, showtimes, date_url)
+                    for st in new_showtimes(selected, alerted, target):
+                        groups.setdefault(st.cinema, {}).setdefault(target, {}).setdefault(st.experience, []).append(st)
+                except Exception as exc:
+                    log.error("[%s] failed %s: %s", watch.id, date_url, exc)
+                    failures.append(f"{date_url}: {exc}")
     proposed = state
     if listed != state.get("movie_listed", {}).get(watch.id, []):
         proposed = {**state, "movie_listed": {**state.get("movie_listed", {}), watch.id: listed}}
@@ -1156,11 +1313,73 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
     return WatchResult(alerts + [Alert(texts=texts, mentions=list(watch.mention))], proposed, tuple(failures))
 
 
+def seat_alert(watch: SeatWatch, movie: str, target: date, st: Showtime,
+               labels: list[str]) -> Alert:
+    texts = {}
+    for name in watch.channels:
+        adapter = CHANNELS[name]
+        lines = [f"🪑 {len(labels)} {adapter.escape(watch.category)} seats free — {adapter.bold(movie)}",
+                 adapter.escape(st.cinema), f"{target:%A, %B} {target.day}, {target:%Y}",
+                 f"{adapter.escape(st.time)} — {adapter.escape(st.experience)}",
+                 f"Free seats: {len(labels)}", adapter.escape(", ".join(labels[:10]) + (", …" if len(labels) > 10 else "")),
+                 adapter.link(Showtime(time="Book now", href=st.href))]
+        texts[name] = adapter.mention_prefix(watch.mention) + "\n".join(lines)
+    return Alert(texts, list(watch.mention))
+
+
+def run_seat_watch(watch: SeatWatch, fetch, state: dict, now: datetime) -> WatchResult:
+    if now.date() > watch.end_date:
+        return WatchResult([], state)
+    site = SITES[watch.site]
+    fired = list(state.get("seat_alerted", {}).get(watch.id, []))
+    alerts, failures, seen = [], [], set()
+    # Reuse Movie match discovery, but Seat watches do not emit Listed Alerts/state.
+    selected = matched_movies(watch, watch.site, site, fetch, [], [], failures)
+    for slug, source, discovery, targets in discover_movie_dates(
+            watch, site, selected, fetch, failures, now):
+        movie = site.movie_title(discovery, slug)
+        for target in targets:
+            if not max(now.date(), watch.start_date) <= target <= watch.end_date:
+                continue
+            try:
+                showtimes = filter_cinemas(watch, site, fetch_showtimes(
+                    watch, site, source, fetch, discovery, target), source.build_url(target))
+            except Exception as exc:
+                failures.append(f"{source.build_url(target)}: {exc}")
+                log.error("[%s] failed: %s", watch.id, failures[-1])
+                continue
+            for st in showtimes:
+                if st.soldout or st.identity in seen:
+                    continue
+                try:
+                    start = datetime.strptime(st.time.replace(" ", "").upper(), "%I:%M%p").strftime("%H:%M")
+                    if start < watch.earliest:
+                        continue
+                    seen.add(st.identity)
+                    labels = site.read_seats(st, watch.category, fetch)
+                    if labels is None:
+                        log.info("[%s] %s: Seat category %s absent - skipping", watch.id, st.identity, watch.category)
+                    elif len(labels) < watch.min_free:
+                        if st.identity in fired:
+                            fired.remove(st.identity)
+                    elif st.identity not in fired:
+                        alerts.append(seat_alert(watch, movie, target, st, labels))
+                        fired.append(st.identity)
+                except Exception as exc:
+                    failures.append(f"{st.href}: {exc}")
+                    log.error("[%s] failed: %s", watch.id, failures[-1])
+    proposed = state
+    if fired != state.get("seat_alerted", {}).get(watch.id, []):
+        proposed = {**state, "seat_alerted": {**state.get("seat_alerted", {}), watch.id: fired}}
+    return WatchResult(alerts, proposed, tuple(failures))
+
+
 def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], state: dict,
               now: datetime, sleep: Optional[Callable[[float], None]] = None) -> WatchResult:
     """Evaluate one Watch, returning Alerts and proposed state without delivery.
 
-    The caller commits the proposed state only after all Alerts have been delivered.
+    The caller commits proposed alert state after all Alerts have been delivered;
+    Seat watch re-arms may be committed without an Alert.
     Failures accompany successful Movie pages in the result. No clock or sleep
     is used here unless the caller injects it.
     """
@@ -1169,6 +1388,8 @@ def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], stat
     now = now.astimezone(ZoneInfo(watch.timezone))
     if not isinstance(fetch, PacedFetch):
         fetch = PacedFetch(fetch, sleep)
+    if isinstance(watch, SeatWatch):
+        return run_seat_watch(watch, fetch, state, now)
     if isinstance(watch, MovieWatch):
         if watch.until is not None and now.date() > watch.until:
             log.info("[%s] until date %s has passed - skipping", watch.id, watch.until.isoformat())
@@ -1233,7 +1454,7 @@ def main() -> int:
 
     changed = False
     failures: list[str] = []
-    fetch = PacedFetch(fetch_page, time.sleep)
+    fetch = PacedFetch(fetch_page, time.sleep, booking_session)
     for watch in watches:
         try:
             result = run_watch(watch, fetch, state, datetime.now(ZoneInfo(watch.timezone)))
@@ -1243,7 +1464,7 @@ def main() -> int:
             for alert in alerts:
                 send_alert(cfg, alert)
                 log.info("[%s] Alert sent to %s", watch.id, ", ".join(alert.texts))
-            if alerts and next_state != state:
+            if next_state != state and (alerts or isinstance(watch, SeatWatch)):
                 state = next_state
                 changed = True
         except Exception as e:  # noqa: BLE001 — one watch must not sink the others

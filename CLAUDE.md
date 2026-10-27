@@ -115,9 +115,41 @@ Load-bearing details that aren't obvious from the code:
   Showtime identity even when Not bookable. Scene discovers dates per Cinema; its identity combines
   Cinema, date, time and Experience. `SCENE_CINEMAS` maps `district-5` and
   `cairo-festival-city` to their URLs and names; a Scene Date watch defaults to District 5.
+- **VOX's cinema-less picker can hide real Showtimes.** Observed 2026-10-28:
+  `/showtimes?m=avengers-doomsday` has the empty notice and no picker, while its
+  `&d=20261217` page has Bookable Showtimes, including Almaza IMAX 7:30pm. Dated
+  pages can also lack date navigation. A missing picker is not proof that a slug
+  has no Showtimes. Discover all of a Watch's slugs on a Site first, then use the
+  union of their dates for each slug. Seat watches also add every date from
+  max(today, configured start) through configured end. Fetch dates absent from
+  a slug's own picker explicitly; the ordinary empty notice there is expected.
+  Keep this union Site-agnostic in the shared pipeline, bounded by existing Watch
+  filters. `PacedFetch` caches page successes and failures for the run, while
+  seat-session GETs (including processing polls) remain uncached.
 - **Discord mentions are restricted.** The webhook sender sets `allowed_mentions` to the Watch's
   listed users, disabling role and everyone mentions. Alerts use each Watch's Channels, defaulting
   to both; a failed Channel causes a retry and may duplicate delivery to a successful Channel.
+- **Bookable on VOX ? seats left.** A full house can still have a booking link.
+  Seat watches use Movie watch discovery, then filter one Cinema, inclusive dates,
+  earliest local start and Bookable status before reading seat maps. `Site.read_seats`
+  owns this capability; Scene has none. Keep Site behavior on the adapter.
+- **Seat maps need one cookie Session per read.** With curl_cffi `chrome124`, GET
+  `/booking/<id>` and retain the final `/booking/<uuid>_<id>/guest/processing` URL;
+  GET that booking base's `/seats/fetch`, then poll `/seats/processing?json=1` with
+  `X-Requested-With: XMLHttpRequest` and `Accept: application/json`, at most five
+  times with two-second waits. When `data.status == 1`, GET `data.url` for the map.
+  Use `PacedFetch.session()` so every request shares pacing with ordinary fetches;
+  inject the session factory and sleep in tests. These are GETs only: never select
+  or reserve seats. Processing/HTTP/markup failures isolate one Showtime and fail
+  the run; they must not re-arm its state.
+- **Count only the seating plan.** `.seating-plan td.seat.<category>` without
+  `sold` or `blank` are free; the legend outside the plan is not a seat. Category
+  matching ignores case and Regular maps to `standard`. Labels come from
+  `label[title]`. An absent category is logged and skipped; a missing plan is a
+  failure. `seat_alerted` stores `{watch_id: [currently_fired_showtime_identities]}`.
+  Add identities only after Alert delivery; remove them below the threshold to
+  re-arm, saving that removal even when there is no Alert. Unchanged state is not
+  written. Retain the existing Date/Movie state keys when loading seat state.
 - **Scene parsing keys off `ex_*` classes.** Experience groups are `<span class="ex_imax|ex_vip|
   ex_stand">` labels; `ex_*_content` wrappers are excluded so only label spans match. Sold out =
   `showtime_soldout` class or a `javascript:` href.
@@ -129,7 +161,7 @@ parsers against saved HTML in `tests/fixtures/`, URL building, `watches.json` va
 migration, Movie watch discovery, dedupe, pruning, Channels, and sample Alerts. Real network,
 Telegram/Discord delivery, and the workflow state commit are untested by design.
 `test_repo_watches_file_is_valid` asserts the committed `watches.json` actually loads and still
-contains the Avengers Movie watch — it guards production config, so don't relax it.
+contains the Avengers Movie watch and Almaza Premium Seat watch — it guards production config, so don't relax it.
 
 When a site's markup changes, capture a fresh page into `tests/fixtures/` and fix the parser against
 it rather than testing live.

@@ -72,6 +72,47 @@ it changes nothing about how the checks themselves work. Instructions: [`schedul
 
 ## What to put in `watches.json`
 
+### Seat watch (VOX)
+
+A booking link on VOX does not guarantee free seats. This watch reads the seat map
+and alerts when at least two Premium seats are free (they need not be adjacent).
+It alerts once while the threshold holds, then re-arms when fewer seats are free.
+
+```json
+{
+  "id": "avengers-almaza-premium",
+  "kind": "seat",
+  "site": "vox",
+  "movie": {
+    "vox": [
+      "avengers-doomsday",
+      "avengers-doomsday-infinity-vision"
+    ]
+  },
+  "match": [
+    "doomsday"
+  ],
+  "cinema_slug": "city-centre-almaza",
+  "dates": {
+    "from": "2026-12-16",
+    "to": "2026-12-18"
+  },
+  "from": "18:00",
+  "category": "Premium",
+  "min_free": 2,
+  "channels": [
+    "telegram",
+    "discord"
+  ]
+}
+```
+
+Dates are inclusive; `from` is the earliest Showtime start in 24-hour local time.
+Seat categories ignore case; `Regular` maps to VOX's `standard` seats. Movie slugs
+and/or `match` use the same discovery as Movie watches. Only currently Bookable
+Showtimes at the selected Cinema are checked. Alerts include up to ten free seat
+labels and the Showtime booking link. Channels and Discord mentions work as above.
+
 ### 🅰️ VOX only
 
 ```json

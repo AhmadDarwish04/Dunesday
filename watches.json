@@ -5,17 +5,50 @@
       "site": "vox",
       "movie_slug": "sense-and-sensibility",
       "cinema_slug": "city-centre-almaza",
-      "target": { "date": "2026-10-29" },
+      "target": {
+        "date": "2026-10-29"
+      },
       "notify_on": "bookable"
     },
     {
       "id": "avengers-doomsday",
       "movie": {
-        "vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
+        "vox": [
+          "avengers-doomsday",
+          "avengers-doomsday-infinity-vision"
+        ],
         "scene": []
       },
-      "match": ["doomsday"],
+      "match": [
+        "doomsday"
+      ],
       "cinemas": "all"
+    },
+    {
+      "id": "avengers-almaza-premium",
+      "kind": "seat",
+      "site": "vox",
+      "movie": {
+        "vox": [
+          "avengers-doomsday",
+          "avengers-doomsday-infinity-vision"
+        ]
+      },
+      "match": [
+        "doomsday"
+      ],
+      "cinema_slug": "city-centre-almaza",
+      "dates": {
+        "from": "2026-12-16",
+        "to": "2026-12-18"
+      },
+      "from": "18:00",
+      "category": "Premium",
+      "min_free": 2,
+      "channels": [
+        "telegram",
+        "discord"
+      ]
     }
   ]
 }
