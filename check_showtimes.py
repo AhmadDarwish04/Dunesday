@@ -702,11 +702,15 @@ def vox_movie_title(html: str, slug: str) -> str:
     return heading.get_text(" ", strip=True) if heading else title_from_slug(slug)
 
 
-def parse_movie_showtimes_vox(html: str, target: date) -> list[Showtime]:
-    """Read Bookable and Not bookable Showtimes with Cinema and stable VOX identity."""
+def parse_movie_showtimes_vox(html: str, target: date, slug: str) -> list[Showtime]:
+    """Read Bookable and Not bookable Showtimes with Cinema and stable VOX identity.
+
+    Only the slug's own movie block counts: when VOX doesn't accept the `m=` filter
+    for a slug, it ignores it and lists every movie showing that day.
+    """
     soup = BeautifulSoup(html, "html.parser")
     showtimes = []
-    for heading in soup.select("h3.highlight"):
+    for heading in soup.select(f'article.movie-compare[data-slug="{slug}"] h3.highlight'):
         cinema = heading.get_text(" ", strip=True)
         block = heading.find_next_sibling("ol", class_="showtimes")
         if block is None:
@@ -733,7 +737,8 @@ def scene_movie_sources(slug: str, cinemas: str | list[str]) -> list[MoviePages]
 
 
 def vox_movie_sources(slug: str, cinemas: str | list[str]) -> list[MoviePages]:
-    return [MoviePages(build_url=partial(vox_movie_url, slug), parse=parse_movie_showtimes_vox)]
+    return [MoviePages(build_url=partial(vox_movie_url, slug),
+                       parse=partial(parse_movie_showtimes_vox, slug=slug))]
 
 
 def scene_listing_sources(cinemas: str | list[str]) -> list[ListingPage]:
