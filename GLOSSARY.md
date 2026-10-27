@@ -24,6 +24,14 @@ _Avoid_: Announced, added
 Keywords a Movie watch uses to find a movie's Movie slugs on each Site by itself; a slug matches when its slug or title contains every keyword.
 _Avoid_: Search, filter
 
+**Seat category**:
+The price tier a seat is sold under within a Showtime's seat map (e.g. VOX "Premium" vs "Regular").
+_Avoid_: Seat type, class, zone
+
+**Seat watch**:
+A Watch on specific Showtimes' seat maps that alerts when at least a given number of seats in a Seat category become free, and re-arms once they are taken again.
+_Avoid_: Seat tracker, availability watch
+
 **Experience**:
 The screen format a Showtime is sold under (Standard, IMAX, GOLD, 4DX, VIP).
 _Avoid_: Format, hall type
