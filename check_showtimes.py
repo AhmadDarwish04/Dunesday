@@ -197,7 +197,7 @@ class Site:
     headers: dict
     # Consulted only when nothing parsed: is an empty result the site's normal
     # "nothing scheduled" response, or a sign the markup changed under us?
-    empty_is_expected: Callable[[str], bool]
+    empty_is_expected: Callable[[str, str], bool]
     # What a non-bookable time means on this site — Scene flags genuine sell-outs,
     # VOX uses one "unavailable" state for both sold out and not-yet-on-sale.
     soldout_label: str
@@ -570,7 +570,7 @@ def scene_display_names(html: str, watch: Watch) -> "tuple[str, str]":
     return movie, cinema
 
 
-def scene_empty_is_expected(html: str) -> bool:
+def scene_empty_is_expected(html: str, slug: str) -> bool:
     """An empty fragment IS Scene's 'nothing scheduled' response, so nothing looks wrong."""
     return True
 
@@ -669,9 +669,12 @@ def vox_display_names(html: str, watch: Watch) -> "tuple[str, str]":
     return movie, cinema
 
 
-def vox_empty_is_expected(html: str) -> bool:
-    """VOX states 'no showtimes' explicitly; its absence means the page structure moved."""
-    return "no showtimes could be found" in html.lower()
+def vox_empty_is_expected(html: str, slug: str) -> bool:
+    """An explicit empty notice or an ignored movie filter is a normal empty result."""
+    if "no showtimes could be found" in html.lower():
+        return True
+    articles = BeautifulSoup(html, "html.parser").select("article.movie-compare")
+    return bool(slug and articles) and all(article.get("data-slug") != slug for article in articles)
 
 
 def vox_movie_dates(html: str) -> list[date]:
@@ -858,7 +861,7 @@ SITES: "dict[str, Site]" = {
         movie_sources=vox_movie_sources,
         movie_dates=vox_movie_dates,
         discovery_date=vox_discovery_date,
-        discovery_empty_is_expected=vox_empty_is_expected,
+        discovery_empty_is_expected=partial(vox_empty_is_expected, slug=""),
         movie_title=vox_movie_title,
         read_seats=vox_read_seats,
         cinema_names={
@@ -1146,12 +1149,12 @@ def discover_movie_dates(watch: MovieWatch, site: Site, selected: dict, fetch,
 
 
 def fetch_showtimes(watch: MovieWatch, site: Site, source: MoviePages, fetch,
-                    discovery: str, target: date) -> list[Showtime]:
+                    discovery: str, target: date, slug: str) -> list[Showtime]:
     url = source.build_url(target)
     use_discovery = target == site.discovery_date(discovery) and target in site.movie_dates(discovery)
     html = discovery if use_discovery else fetch(url, site.headers)
     showtimes = source.parse(html, target)
-    if not showtimes and not site.empty_is_expected(html):
+    if not showtimes and not site.empty_is_expected(html, slug):
         warn_markup(watch.id, url)
     return showtimes
 
@@ -1305,7 +1308,7 @@ def run_movie_watch(watch: MovieWatch, fetch: Callable[[str, dict], str], state:
                     continue
                 date_url = source.build_url(target)
                 try:
-                    showtimes = fetch_showtimes(watch, site, source, fetch, discovery, target)
+                    showtimes = fetch_showtimes(watch, site, source, fetch, discovery, target, slug)
                     selected = filter_cinemas(watch, site, showtimes, date_url)
                     for st in new_showtimes(selected, alerted, target):
                         groups.setdefault(st.cinema, {}).setdefault(target, {}).setdefault(st.experience, []).append(st)
@@ -1355,7 +1358,7 @@ def run_seat_watch(watch: SeatWatch, fetch, state: dict, now: datetime) -> Watch
                 continue
             try:
                 showtimes = filter_cinemas(watch, site, fetch_showtimes(
-                    watch, site, source, fetch, discovery, target), source.build_url(target))
+                    watch, site, source, fetch, discovery, target, slug), source.build_url(target))
             except Exception as exc:
                 failures.append(f"{source.build_url(target)}: {exc}")
                 log.error("[%s] failed: %s", watch.id, failures[-1])
@@ -1424,7 +1427,7 @@ def run_watch(watch: Watch | MovieWatch, fetch: Callable[[str, dict], str], stat
     total = sum(len(v) for v in groups.values())
 
     if total == 0:
-        if not site.empty_is_expected(html):
+        if not site.empty_is_expected(html, watch.movie_slug):
             warn_markup(watch.id, url)
         log.info("[%s] No showtimes yet for %s", watch.id, target.isoformat())
         return WatchResult([], state)

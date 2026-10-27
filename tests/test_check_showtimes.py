@@ -108,12 +108,19 @@ def test_parse_vox_no_showtimes_returns_empty():
     # VOX serves a full page with a notice rather than an empty body.
     html = _read("vox_no_showtimes.html")
     assert parse_showtimes_vox(html) == {}
-    assert vox_empty_is_expected(html) is True
+    assert vox_empty_is_expected(html, "avengers-doomsday") is True
 
 
 def test_vox_empty_is_expected_flags_unexpected_page():
     # No showtimes AND no notice → the page structure changed and we should warn.
-    assert vox_empty_is_expected("<html><body><p>Something else entirely</p></body></html>") is False
+    assert vox_empty_is_expected("<html><body><p>Something else entirely</p></body></html>", "avengers-doomsday") is False
+
+
+def test_vox_expected_empty_distinguishes_ignored_filter_from_broken_movie_markup():
+    html = _read("vox_doomsday_dated_no_picker.html")
+    assert vox_empty_is_expected(html, "avengers-doomsday") is True
+    assert vox_empty_is_expected(html, "avengers-doomsday-infinity-vision") is False
+    assert vox_empty_is_expected('<article class="movie-compare" data-slug="watched"></article>', "watched") is False
 
 
 def test_parse_vox_groups_by_screen_type():
@@ -951,7 +958,14 @@ def test_movie_watch_rejects_bad_config(tmp_path, extra, message):
 def test_run_movie_watch_combines_multiple_slugs_in_one_alert(tmp_path):
     watch = _movie_watch(tmp_path, movie={"vox": ["avengers-doomsday-infinity-vision", "avengers-doomsday"], "scene": []})
     pages = {**_movie_pages(), **_movie_pages("vox_movie_now_bookable.html", "avengers-doomsday")}
-    alerts, state, failures = run_watch(watch, _fixture_fetch(pages), {"notified_for": {}}, MOVIE_NOW, sleep=lambda _: None)
+    def fetch(url, headers):
+        html = _fixture_fetch(pages)(url, headers)
+        if "m=avengers-doomsday&" in url or url.endswith("m=avengers-doomsday"):
+            # DERIVED: assign these Showtimes to the plain slug for aggregation/dedupe testing.
+            html = html.replace('data-slug="avengers-doomsday-infinity-vision"',
+                                'data-slug="avengers-doomsday"')
+        return html
+    alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW, sleep=lambda _: None)
     assert not failures
     assert len(alerts) == 1 and "83 New Showtimes" in alerts[0].texts["telegram"]
     assert len(state["movie_alerted"]["avengers"]) == 83
@@ -1717,7 +1731,15 @@ def test_seat_watch_deduplicates_variants_and_inclusive_start_time(tmp_path):
     pages = {**_movie_pages(), **_movie_pages(slug="avengers-doomsday")}
     for slug in watch.movie["vox"]:
         pages[f"https://egy.voxcinemas.com/showtimes?m={slug}&d=20261217"] = "vox_seat_showtimes.html"
-    fetch = SeatFetch(pages=pages)
+    class VariantFetch(SeatFetch):
+        def __call__(self, url, headers):
+            html = super().__call__(url, headers)
+            if "m=avengers-doomsday&" in url or url.endswith("m=avengers-doomsday"):
+                # DERIVED: both variants own the same test identity, exercising dedupe.
+                html = html.replace('data-slug="avengers-doomsday-infinity-vision"',
+                                    'data-slug="avengers-doomsday"')
+            return html
+    fetch = VariantFetch(pages=pages)
     alerts, _, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
     assert not failures and len(alerts) == 1 and fetch.flows == 1
 
@@ -1822,6 +1844,42 @@ def test_seat_watch_cinema_filter_uses_adapter_slug_mapping(tmp_path):
 DOOMSDAY_URL = "https://egy.voxcinemas.com/showtimes?m=avengers-doomsday"
 
 
+@pytest.mark.parametrize("kind", ["movie", "seat"])
+@pytest.mark.parametrize("slug", ["avengers-doomsday", "avengers-doomsday-infinity-vision"])
+def test_other_movies_never_produce_watched_showtimes_or_alerts(tmp_path, caplog, kind, slug):
+    from bs4 import BeautifulSoup
+    # DERIVED when watching IV: remove its article, leaving only the live Dune block.
+    soup = BeautifulSoup(_read("vox_doomsday_dated_no_picker.html"), "html.parser")
+    for article in soup.select(f'article.movie-compare[data-slug="{slug}"]'):
+        article.decompose()
+    html = str(soup)
+    target = date(2026, 12, 17)
+    assert SITES["vox"].movie_sources(slug, "all")[0].parse(html, target) == []
+    watch = (_seat_watch if kind == "seat" else _movie_watch)(tmp_path, movie={"vox": [slug]})
+    class OtherMoviesFetch(SeatFetch):
+        def __call__(self, url, headers):
+            assert url == f"https://egy.voxcinemas.com/showtimes?m={slug}"
+            return html  # Current dated discovery page is reused, without another fetch.
+    fetch = OtherMoviesFetch()
+    initial = {"notified_for": {}}
+    assert run_watch(watch, fetch, initial, MOVIE_NOW) == ([], initial, ())
+    assert fetch.flows == 0
+    assert "page structure may have changed" not in caplog.text
+
+
+def test_movie_watch_dated_page_without_articles_or_empty_notice_still_warns(tmp_path, caplog):
+    watch = _movie_watch(tmp_path)
+    pages = _movie_pages()
+    def fetch(url, headers):
+        if url == MOVIE_URL + "&d=20261217":
+            return "<html><body>Unexpected markup</body></html>"
+        return _fixture_fetch(pages)(url, headers)
+    result = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW, sleep=lambda _: None)
+    assert not result.failures
+    assert "page structure may have changed" in caplog.text
+    assert MOVIE_URL + "&d=20261217" in caplog.text
+
+
 @pytest.mark.parametrize("missing_picker_first", [False, True])
 def test_movie_watch_uses_other_slugs_dates_when_discovery_has_no_picker(tmp_path, caplog, missing_picker_first):
     slugs = ["avengers-doomsday-infinity-vision", "avengers-doomsday"]
@@ -1837,9 +1895,18 @@ def test_movie_watch_uses_other_slugs_dates_when_discovery_has_no_picker(tmp_pat
         return _fixture_fetch(pages)(url, headers)
     alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
     assert not failures
-    assert "0047-276744" in state["movie_alerted"][watch.id]
+    assert "0028-568252" in state["movie_alerted"][watch.id]
+    assert "0047-276744" not in state["movie_alerted"][watch.id]
     assert len(alerts) == 1
-    assert alerts[0].texts["telegram"].count("booking/0047-276744") == 1
+    assert alerts[0].texts["telegram"].count("booking/0028-568252") == 1
+    assert "booking/0047-276744" not in alerts[0].texts["telegram"]
+    # The plain-slug probe contributes nothing; all Showtimes come from IV.
+    iv = _movie_watch(tmp_path)
+    assert state["movie_alerted"][watch.id] == run_watch(
+        iv, _fixture_fetch(_movie_pages()), {"notified_for": {}}, MOVIE_NOW,
+        sleep=lambda _: None).state["movie_alerted"][iv.id]
+    assert SITES["vox"].movie_sources("avengers-doomsday", "all")[0].parse(
+        _read("vox_doomsday_dated_no_picker.html"), date(2026, 12, 17)) == []
     assert DOOMSDAY_URL + "&d=20261216" in calls
     assert len(calls) == len(set(calls))
     assert "page structure may have changed" not in caplog.text
@@ -1847,35 +1914,27 @@ def test_movie_watch_uses_other_slugs_dates_when_discovery_has_no_picker(tmp_pat
 
 @pytest.mark.parametrize("with_other_slug", [False, True])
 def test_seat_watch_reads_dated_showtimes_without_discovery_picker(tmp_path, with_other_slug):
-    from bs4 import BeautifulSoup
-    slugs = ["avengers-doomsday"] + (["avengers-doomsday-infinity-vision"] if with_other_slug else [])
+    slugs = ["avengers-doomsday-infinity-vision"] + (["avengers-doomsday"] if with_other_slug else [])
     watch = _seat_watch(tmp_path, movie={"vox": slugs})
-    # Derived from the live dated page: mark the 11pm Showtime Not bookable so the
-    # test reads only the IMAX seat map captured for 7:30pm (0047-276744).
-    soup = BeautifulSoup(_read("vox_doomsday_dated_no_picker.html"), "html.parser")
-    late = soup.select_one('li[data-id="0047-276745"] .action.showtime')
-    late.name = "span"
-    late.attrs.pop("href", None)
-    late["class"].append("unavailable")
-    for current in soup.select("input[name=d]"):
-        current.decompose()
-    html = "<!-- DERIVED: 0047-276745 Not bookable; hidden date input removed. -->\n" + str(soup)
     class NoPickerFetch(SeatFetch):
         def __init__(self):
             super().__init__()
             self.page_calls = []
         def __call__(self, url, headers):
             self.page_calls.append(url)
-            if url == DOOMSDAY_URL:
+            if url in (MOVIE_URL, DOOMSDAY_URL):
                 return _read("vox_doomsday_empty_discovery.html")
+            if url == MOVIE_URL + "&d=20261217":
+                return _read("vox_seat_showtimes.html")
             if url == DOOMSDAY_URL + "&d=20261217":
-                return html
+                return _read("vox_doomsday_dated_no_picker.html")
             return super().__call__(url, headers)
     fetch = NoPickerFetch()
     alerts, state, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
     assert not failures and len(alerts) == 1
     assert fetch.flows == 1
-    assert DOOMSDAY_URL + "&d=20261217" in fetch.page_calls
+    assert MOVIE_URL + "&d=20261217" in fetch.page_calls
+    assert (DOOMSDAY_URL + "&d=20261217" in fetch.page_calls) is with_other_slug
     assert len(fetch.page_calls) == len(set(fetch.page_calls))
     assert state["seat_alerted"] == {watch.id: ["0047-276744"]}
 
@@ -1899,10 +1958,12 @@ def test_movie_watch_shared_candidate_pages_fetched_once_across_watches(tmp_path
     other = _movie_watch(tmp_path, id="other", movie=watch.movie)
     second = run_watch(other, paced, first.state, MOVIE_NOW)
     assert bool(first.failures) is failed_page and bool(second.failures) is failed_page
-    assert "0047-276744" in first.state["movie_alerted"][watch.id]
-    assert "0047-276744" in second.state["movie_alerted"][other.id]
+    assert "0028-568252" in first.state["movie_alerted"][watch.id]
+    assert "0028-568252" in second.state["movie_alerted"][other.id]
+    assert "0047-276744" not in first.state["movie_alerted"][watch.id]
+    assert "0047-276744" not in second.state["movie_alerted"][other.id]
     assert len(calls) == len(set(calls))
-    # This MAX Showtime appears in both slugs' dated pages but alerts once.
+    # This MAX Showtime appears on both pages, but only the IV slug owns it.
     assert first.alerts[0].texts["telegram"].count("booking/0028-568252") == 1
     assert initial == {"notified_for": {}}
 

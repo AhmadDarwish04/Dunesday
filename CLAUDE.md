@@ -55,9 +55,10 @@ Load-bearing details that aren't obvious from the code:
 - **Absence of showtimes is the signal.** Both sites publish only a rolling window of dates, so
   "parsed nothing" means "not published yet" and exits 0 quietly. The two sites express it
   differently: Scene returns an **empty body**; VOX returns a **full page** with a "No showtimes
-  could be found" notice. That's why each adapter carries `empty_is_expected` — for VOX, no
-  showtimes *and* no notice means the markup moved and we log a warning instead of silently never
-  notifying. If alerts stop, suspect the parser before the schedule.
+  could be found" notice, or ignores the movie filter and lists other movies. That's why each
+  adapter carries a slug-aware `empty_is_expected` — for VOX, no showtimes, no notice and no
+  other-movies-only response means the markup may have moved and we log a warning instead of
+  silently never notifying. If alerts stop, suspect the parser before the schedule.
 - **"Published" and "bookable" are different events, and watches choose.** Both sites list a
   date's showtimes before opening sales, so `Watch.notify_on` selects the trigger via
   `should_notify`: `published` (default) fires on any showtime; `bookable` waits for a non-sold-out
@@ -117,8 +118,13 @@ Load-bearing details that aren't obvious from the code:
   `cairo-festival-city` to their URLs and names; a Scene Date watch defaults to District 5.
 - **VOX's cinema-less picker can hide real Showtimes.** Observed 2026-10-28:
   `/showtimes?m=avengers-doomsday` has the empty notice and no picker, while its
-  `&d=20261217` page has Bookable Showtimes, including Almaza IMAX 7:30pm. Dated
-  pages can also lack date navigation. A missing picker is not proof that a slug
+  `&d=20261217` page ignores the unsupported movie filter and lists separate
+  `article.movie-compare[data-slug]` blocks for Infinity Vision and Dune: Part Three.
+  The plain slug has no Showtimes on that page; Almaza IMAX 7:30pm (`0047-276744`)
+  belongs to Dune. Parse only the watched slug's own article, so other movies never
+  become its Showtimes or Alerts. Other-movies-only dated pages are expected empty
+  results, without markup warnings. Dated pages can also lack date navigation.
+  A missing picker is not proof that a slug
   has no Showtimes. Discover all of a Watch's slugs on a Site first, then use the
   union of their dates for each slug. Seat watches also add every date from
   max(today, configured start) through configured end. Fetch dates absent from
