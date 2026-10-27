@@ -523,3 +523,63 @@ def test_run_published_date_watch_uses_watch_timezone_and_not_bookable_showtimes
     assert "(not bookable)" in alerts[0].texts["telegram"]
     assert next_state == {"notified_for": {"w": "20260731"}}
     assert state == {"notified_for": {}}
+
+
+def test_run_scene_date_watch_at_cairo_festival_city(tmp_path):
+    path = _write_watches(tmp_path, [{
+        "id": "cfc", "site": "scene", "movie_slug": "resident_evil",
+        "cinema_slug": "cairo-festival-city", "target": {"date": "2026-10-29"},
+    }])
+    watch = load_watches(path)[0]
+    url = "https://cfc.scenecinemas.com/movie-details/resident_evil.html?business_day=29-10-2026&ajax=1"
+    now = datetime(2026, 10, 28, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    alerts, state = run_watch(watch, _fixture_fetch({url: "scene_cfc_with_showtimes.html"}),
+                              {"notified_for": {}}, now)
+    assert len(alerts) == 1
+    assert "Scene Cinema - Cairo Festival City" in alerts[0].texts["telegram"]
+    assert state == {"notified_for": {"cfc": "20261029"}}
+
+
+def test_run_existing_scene_date_watch_defaults_to_district_5():
+    watch = next(w for w in load_watches(REPO_ROOT / "watches.json")
+                 if w.id == "odyssey-d5-friday")
+    url = "https://district5.scenecinemas.com/movie-details/the-odyssey.html?business_day=31-07-2026&ajax=1"
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    alerts, state = run_watch(watch, _fixture_fetch({url: "scene_with_showtimes.html"}),
+                              {"notified_for": {}}, now)
+    assert "Scene Cinema - District 5" in alerts[0].texts["telegram"]
+    assert state == {"notified_for": {"odyssey-d5-friday": "20260731"}}
+
+
+def test_load_watches_rejects_unknown_scene_cinema(tmp_path):
+    path = _write_watches(tmp_path, [{
+        "id": "bad", "site": "scene", "movie_slug": "m", "cinema_slug": "unknown",
+        "target": {"date": "2026-10-29"},
+    }])
+    with pytest.raises(RuntimeError, match="district-5.*cairo-festival-city|cairo-festival-city.*district-5"):
+        load_watches(path)
+
+
+def test_parse_scene_cairo_festival_city_showtimes():
+    groups = parse_showtimes_scene(_read("scene_cfc_with_showtimes.html"))
+    assert list(groups) == ["Standard"]
+    assert [showtime.time for showtime in groups["Standard"]] == [
+        "10:30 AM", "01:00 PM", "03:15 PM", "05:30 PM", "08:00 PM", "10:15 PM", "12:30 AM",
+    ]
+    assert all(not showtime.soldout and showtime.href.startswith("https://cfc.scenecinemas.com/")
+               for showtime in groups["Standard"])
+
+
+def test_run_scene_date_watch_with_base_url_override(tmp_path):
+    path = _write_watches(tmp_path, [{
+        "id": "cfc", "site": "scene", "movie_slug": "resident_evil",
+        "cinema_slug": "cairo-festival-city", "target": {"date": "2026-10-29"},
+        "base_url": "https://example.com/movie-details/{movie}.html",
+    }])
+    watch = load_watches(path)[0]
+    url = "https://example.com/movie-details/resident_evil.html?business_day=29-10-2026&ajax=1"
+    now = datetime(2026, 10, 28, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    alerts, state = run_watch(watch, _fixture_fetch({url: "scene_cfc_with_showtimes.html"}),
+                              {"notified_for": {}}, now)
+    assert "Scene Cinema - Cairo Festival City" in alerts[0].texts["telegram"]
+    assert state == {"notified_for": {"cfc": "20261029"}}

@@ -35,8 +35,13 @@ import requests
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
-SCENE_MOVIE_BASE = "https://district5.scenecinemas.com/movie-details/{movie}.html"
-SCENE_CINEMA_NAME = "Scene Cinemas — District 5"
+SCENE_CINEMAS = {
+    "district-5": ("https://district5.scenecinemas.com/movie-details/{movie}.html",
+                   "Scene Cinemas — District 5"),
+    "cairo-festival-city": ("https://cfc.scenecinemas.com/movie-details/{movie}.html",
+                            "Scene Cinemas — Cairo Festival City"),
+}
+SCENE_CINEMA_NAME = SCENE_CINEMAS["district-5"][1]
 SCENE_SHOWTIMES_URL = "{base}?business_day={date}&ajax=1"
 VOX_SHOWTIMES_URL = "https://egy.voxcinemas.com/showtimes?c={cinema}&m={movie}&d={date}"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -194,7 +199,11 @@ def load_watches(path: Path, default_timezone: str = "Africa/Cairo") -> "list[Wa
 
         base_url = str(e.get("base_url") or "").strip()
         if site == "scene":
-            base_url = base_url or SCENE_MOVIE_BASE
+            if cinema_slug and cinema_slug not in SCENE_CINEMAS:
+                raise RuntimeError(
+                    f"{where}: unknown Scene cinema_slug {cinema_slug!r}; "
+                    f"valid slugs: {', '.join(SCENE_CINEMAS)}")
+            base_url = base_url or SCENE_CINEMAS[cinema_slug or "district-5"][0]
             if "{movie}" in base_url:
                 base_url = base_url.format(movie=movie_slug)
 
@@ -334,10 +343,11 @@ def parse_showtimes_scene(html: str) -> "dict[str, list[Showtime]]":
 
 
 def scene_display_names(html: str, watch: Watch) -> "tuple[str, str]":
-    """Return (movie_title, cinema_name); cinema comes from the fragment's branch label."""
+    """Return (movie_title, cinema_name); cinema comes from the fragment's branch label,
+    falling back to the selected Scene Cinema's table name."""
     movie = title_from_slug(watch.movie_slug)
 
-    cinema = SCENE_CINEMA_NAME
+    cinema = SCENE_CINEMAS[watch.cinema_slug or "district-5"][1]
     soup = BeautifulSoup(html, "html.parser")
     branch = soup.find(class_="branch")
     if branch and branch.get_text(strip=True):
