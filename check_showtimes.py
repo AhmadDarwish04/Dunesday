@@ -116,6 +116,13 @@ class Showtime:
 
 
 @dataclass(frozen=True)
+class Alert:
+    """Text keyed by Channel name, with the mentions to include in the Alert."""
+    texts: dict[str, str]
+    mentions: list[str]
+
+
+@dataclass(frozen=True)
 class Site:
     """Per-site adapter: how to build the URL, fetch it, and read showtimes out of it."""
     build_url: Callable[[Watch, date], str]
@@ -449,7 +456,7 @@ def title_from_slug(slug: str) -> str:
 
 
 def should_notify(notify_on: str, total: int, bookable: int) -> bool:
-    """Has this watch's trigger fired? Split out from `check_watch` so it's directly testable."""
+    """Has this watch's trigger fired? Split out from `run_watch` so it's directly testable."""
     if total == 0:
         return False
     if notify_on == "bookable":
@@ -529,21 +536,28 @@ def save_state(path: Path, state: dict) -> None:
 # ------------------------------------------------------------------------------ run
 
 
-def check_watch(watch: Watch, cfg: Config, state: dict) -> bool:
-    """Check one watch; send a notification if it just went live. Returns True if state changed."""
+def run_watch(watch: Watch, fetch: Callable[[str, dict], str], state: dict,
+              now: datetime) -> tuple[list[Alert], dict]:
+    """Evaluate one Date watch, returning Alerts and proposed state without delivery.
+
+    The caller commits the proposed state only after all Alerts have been delivered.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be an aware datetime")
+    now = now.astimezone(ZoneInfo(watch.timezone))
     site = SITES[watch.site]
-    target = resolve_target_date(watch)
+    target = resolve_target_date(watch, now=now)
     dedupe_key = target.strftime("%Y%m%d")
 
-    if watch.target_date is not None and target < today_in(watch.timezone):
+    if watch.target_date is not None and target < today_in(watch.timezone, now=now):
         log.info("[%s] target date %s has passed — skipping", watch.id, target.isoformat())
-        return False
+        return [], state
 
     url = site.build_url(watch, target)
     log.info("[%s] checking %s on %s", watch.id, watch.movie_slug, target.isoformat())
     log.info("[%s] URL: %s", watch.id, url)
 
-    html = fetch_page(url, headers=site.headers)
+    html = fetch(url, site.headers)
     groups = site.parse(html)
     total = sum(len(v) for v in groups.values())
 
@@ -552,7 +566,7 @@ def check_watch(watch: Watch, cfg: Config, state: dict) -> bool:
             log.warning("[%s] no showtimes AND no expected empty-state marker — "
                         "the page structure may have changed", watch.id)
         log.info("[%s] No showtimes yet for %s", watch.id, target.isoformat())
-        return False
+        return [], state
 
     bookable = sum(1 for v in groups.values() for s in v if not s.soldout)
     log.info("[%s] Found %d showtimes (%d bookable) across %d screen types: %s",
@@ -562,21 +576,18 @@ def check_watch(watch: Watch, cfg: Config, state: dict) -> bool:
         # notify_on="bookable": the date is published but sales haven't opened. Stay
         # silent and keep checking — state is deliberately not written here.
         log.info("[%s] %d showtimes listed but none bookable yet — waiting", watch.id, total)
-        return False
+        return [], state
 
     if state["notified_for"].get(watch.id) == dedupe_key:
         log.info("[%s] Already notified for %s", watch.id, dedupe_key)
-        return False
+        return [], state
 
     movie, cinema = site.display_names(html, watch)
     headline = "is now bookable!" if watch.notify_on == "bookable" else "showtimes are live!"
     text = format_message(movie, cinema, target, groups,
                           soldout_label=site.soldout_label, headline=headline)
-    send_telegram(cfg.telegram_token, cfg.telegram_chat_id, text)
-    log.info("[%s] Telegram notification sent for %s", watch.id, dedupe_key)
-
-    state["notified_for"][watch.id] = dedupe_key
-    return True
+    next_state = {**state, "notified_for": {**state["notified_for"], watch.id: dedupe_key}}
+    return [Alert(texts={"telegram": text}, mentions=[])], next_state
 
 
 def main() -> int:
@@ -595,7 +606,15 @@ def main() -> int:
     failures: list[str] = []
     for watch in watches:
         try:
-            changed |= check_watch(watch, cfg, state)
+            alerts, next_state = run_watch(
+                watch, fetch_page, state, datetime.now(ZoneInfo(watch.timezone)))
+            for alert in alerts:
+                send_telegram(cfg.telegram_token, cfg.telegram_chat_id, alert.texts["telegram"])
+                log.info("[%s] Telegram notification sent for %s",
+                         watch.id, next_state["notified_for"][watch.id])
+            if next_state != state:
+                state = next_state
+                changed = True
         except Exception as e:  # noqa: BLE001 — one watch must not sink the others
             log.error("[%s] failed: %s", watch.id, e)
             failures.append(watch.id)

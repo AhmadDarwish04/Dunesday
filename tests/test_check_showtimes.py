@@ -22,6 +22,7 @@ from check_showtimes import (  # noqa: E402
     parse_showtimes_scene,
     parse_showtimes_vox,
     resolve_target_date,
+    run_watch,
     scene_url,
     should_notify,
     vox_display_names,
@@ -341,3 +342,184 @@ def test_load_state_reads_per_watch_map(tmp_path):
 
 def test_load_state_missing_file_is_empty(tmp_path):
     assert load_state(tmp_path / "nope.json", []) == {"notified_for": {}}
+
+# ------------------------------------------------------------------------- run watch
+
+
+def _fixture_fetch(pages):
+    def fetch(url, headers):
+        return _read(pages[url])
+    return fetch
+
+
+@pytest.mark.parametrize("site,fixture,url", [
+    ("scene", "scene_no_showtimes.html",
+     "https://district5.scenecinemas.com/movie-details/the-odyssey.html?business_day=31-07-2026&ajax=1"),
+    ("vox", "vox_no_showtimes.html",
+     "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&m=the-odyssey&d=20260731"),
+])
+def test_run_date_watch_not_yet_published_is_quiet(site, fixture, url, caplog):
+    watch = Watch(id="w", site=site, movie_slug="the-odyssey", timezone="Africa/Cairo",
+                  cinema_slug="city-centre-almaza", target_weekday="friday",
+                  base_url="https://district5.scenecinemas.com/movie-details/the-odyssey.html")
+    state = {"notified_for": {"other": "20260724"}}
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    assert run_watch(watch, _fixture_fetch({url: fixture}), state, now) == ([], state)
+    assert not caplog.records
+
+
+def test_run_date_watch_published_alert_and_dedupe():
+    watch = Watch(id="w", site="scene", movie_slug="the-odyssey", timezone="Africa/Cairo",
+                  target_weekday="friday",
+                  base_url="https://district5.scenecinemas.com/movie-details/the-odyssey.html")
+    url = "https://district5.scenecinemas.com/movie-details/the-odyssey.html?business_day=31-07-2026&ajax=1"
+    fetch = _fixture_fetch({url: "scene_with_showtimes.html"})
+    state = {"notified_for": {"other": "20260724"}}
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    alerts, next_state = run_watch(watch, fetch, state, now)
+    assert len(alerts) == 1
+    assert alerts[0].texts == {"telegram": (
+        '\U0001f3ac <b>The Odyssey</b> showtimes are live!\n'
+        '\U0001f4cd Scene Cinema - District 5\n'
+        '\U0001f4c5 Friday, July 31, 2026\n\n'
+        '<b>IMAX</b>\n'
+        '\u2022 <s>04:00 PM</s> (sold out)\n'
+        '\u2022 <a href="https://district5.scenecinemas.com/showtime-6a5fc5c9f395a1f0c8143b76">08:00 PM</a>\n'
+        '\u2022 <s>12:00 AM</s> (sold out)\n\n'
+        '<b>Premiere</b>\n'
+        '\u2022 <s>05:15 PM</s> (sold out)\n'
+        '\u2022 <s>08:30 PM</s> (sold out)\n'
+        '\u2022 <s>12:00 AM</s> (sold out)\n\n'
+        '<b>Standard & Deluxe</b>\n'
+        '\u2022 <a href="https://district5.scenecinemas.com/showtime-6a634c63f395a1f0c818542c">04:00 PM</a>'
+    )}
+    assert alerts[0].mentions == []
+    assert next_state == {"notified_for": {"other": "20260724", "w": "20260731"}}
+    assert state == {"notified_for": {"other": "20260724"}}
+    assert run_watch(watch, fetch, next_state, now) == ([], next_state)
+
+
+def test_run_fixed_date_watch_holds_off_then_alerts_when_bookable():
+    watch = Watch(id="w", site="vox", movie_slug="spider-man-brand-new-day",
+                  timezone="Africa/Cairo", cinema_slug="city-centre-almaza",
+                  target_date=date(2026, 8, 6), notify_on="bookable")
+    url = "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&m=spider-man-brand-new-day&d=20260806"
+    state = {"notified_for": {}}
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    assert run_watch(watch, _fixture_fetch({url: "vox_not_bookable.html"}), state, now) == ([], state)
+    alerts, next_state = run_watch(watch, _fixture_fetch({url: "vox_with_showtimes.html"}), state, now)
+    assert alerts[0].texts == {"telegram": (
+        '\U0001f3ac <b>Spider-Man: Brand New Day</b> is now bookable!\n'
+        '\U0001f4cd City Centre Almaza\n'
+        '\U0001f4c5 Thursday, August 6, 2026\n\n'
+        '<b>GOLD</b>\n'
+        '\u2022 <s>1:30pm</s> (not bookable)\n'
+        '\u2022 <s>4:45pm</s> (not bookable)\n'
+        '\u2022 <s>8:00pm</s> (not bookable)\n\n'
+        '<b>4DX</b>\n'
+        '\u2022 <s>12:45pm</s> (not bookable)\n'
+        '\u2022 <s>4:00pm</s> (not bookable)\n\n'
+        '<b>Standard</b>\n'
+        '\u2022 <a href="https://egy.voxcinemas.com/booking/0047-266952">1:45pm</a>\n'
+        '\u2022 <a href="https://egy.voxcinemas.com/booking/0047-266953">5:00pm</a>\n'
+        '\u2022 <a href="https://egy.voxcinemas.com/booking/0047-266954">8:15pm</a>\n'
+        '\u2022 <a href="https://egy.voxcinemas.com/booking/0047-266955">11:30pm</a>'
+    )}
+    assert len(alerts) == 1 and alerts[0].mentions == []
+    assert next_state == {"notified_for": {"w": "20260806"}}
+    assert state == {"notified_for": {}}
+    assert run_watch(watch, _fixture_fetch({url: "vox_with_showtimes.html"}), next_state, now) == ([], next_state)
+
+
+def test_run_date_watch_skips_past_fixed_date_without_fetching():
+    watch = Watch(id="w", site="vox", movie_slug="m", timezone="Africa/Cairo",
+                  cinema_slug="c", target_date=date(2026, 7, 26))
+    state = {"notified_for": {}}
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    assert run_watch(watch, _fixture_fetch({}), state, now) == ([], state)
+
+
+def test_run_date_watch_requires_an_aware_clock():
+    watch = Watch(id="w", site="scene", movie_slug="m", timezone="Africa/Cairo",
+                  target_weekday="friday")
+    with pytest.raises(ValueError, match="aware"):
+        run_watch(watch, _fixture_fetch({}), {"notified_for": {}}, datetime(2026, 7, 27, 10))
+
+
+@pytest.mark.parametrize("failure", ["fetch", "delivery"])
+def test_main_keeps_failed_watch_state_and_delivers_other_alerts(tmp_path, monkeypatch, failure):
+    import check_showtimes as notifier
+
+    watches_path = _write_watches(tmp_path, [
+        {"id": wid, "site": "vox", "movie_slug": wid, "cinema_slug": "city-centre-almaza",
+         "target": {"date": "2026-08-06"}} for wid in ("failed", "successful")
+    ])
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"notified_for": {"failed": "20260724"}}), encoding="utf-8")
+    monkeypatch.setenv("WATCHES_FILE", str(watches_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test-chat")
+    monkeypatch.setattr(notifier, "DEFAULT_STATE_PATH", state_path)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo")).astimezone(tz)
+
+    monkeypatch.setattr(notifier, "datetime", FrozenDatetime)
+    pages = {
+        f"https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&m={wid}&d=20260806":
+        "vox_with_showtimes.html" for wid in ("failed", "successful")
+    }
+    fetch_fixture = _fixture_fetch(pages)
+
+    def fetch(url, headers):
+        if failure == "fetch" and "m=failed&" in url:
+            raise RuntimeError("Site failed")
+        return fetch_fixture(url, headers)
+
+    delivered = []
+
+    def send(token, chat_id, text):
+        if failure == "delivery" and not delivered:
+            delivered.append("failed delivery")
+            raise RuntimeError("Channel failed")
+        delivered.append(text)
+
+    monkeypatch.setattr(notifier, "fetch_page", fetch)
+    monkeypatch.setattr(notifier, "send_telegram", send)
+    assert notifier.main() == 1
+    assert "showtimes are live!" in delivered[-1]
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "notified_for": {"failed": "20260724", "successful": "20260806"}
+    }
+
+
+def test_run_date_watch_warns_when_empty_page_markup_changes(caplog):
+    watch = Watch(id="w", site="vox", movie_slug="m", timezone="Africa/Cairo",
+                  cinema_slug="c", target_date=date(2026, 8, 6))
+    url = "https://egy.voxcinemas.com/showtimes?c=c&m=m&d=20260806"
+    state = {"notified_for": {}}
+    now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
+    assert run_watch(watch, _fixture_fetch({url: "vox_missing_empty_marker.html"}), state, now) == ([], state)
+    assert "no showtimes AND no expected empty-state marker" in caplog.text
+
+
+@pytest.mark.parametrize("target", [
+    {"target_weekday": "friday"},
+    {"target_date": date(2026, 7, 31)},
+])
+def test_run_published_date_watch_uses_watch_timezone_and_not_bookable_showtimes(target):
+    watch = Watch(id="w", site="vox", movie_slug="m", timezone="Africa/Cairo",
+                  cinema_slug="c", **target)
+    url = "https://egy.voxcinemas.com/showtimes?c=c&m=m&d=20260731"
+    state = {"notified_for": {}}
+    # Thursday in UTC is already Friday in the Watch's timezone.
+    now = datetime(2026, 7, 30, 22, tzinfo=ZoneInfo("UTC"))
+    alerts, next_state = run_watch(watch, _fixture_fetch({url: "vox_not_bookable.html"}), state, now)
+    assert len(alerts) == 1
+    assert "showtimes are live!" in alerts[0].texts["telegram"]
+    assert "Friday, July 31, 2026" in alerts[0].texts["telegram"]
+    assert "(not bookable)" in alerts[0].texts["telegram"]
+    assert next_state == {"notified_for": {"w": "20260731"}}
+    assert state == {"notified_for": {}}
