@@ -1567,7 +1567,8 @@ def _seat_watch(tmp_path, **extra):
 
 
 class SeatFetch:
-    def __init__(self, fixture="vox_seats_2.html", *, ready=True, pages=None):
+    def __init__(self, fixture="vox_seats_2.html", *, ready=True, pages=None, login_choice=False):
+        self.login_choice = login_choice
         self.pages = pages or {**_movie_pages(), MOVIE_URL + "&d=20261217": "vox_seat_showtimes.html"}
         self.fixture = fixture
         self.ready = ready
@@ -1590,7 +1591,8 @@ class SeatFetch:
                 base = "https://egy.voxcinemas.com/booking/e1e56d29-3949-4621-9867-576e412a1992_0047-276744"
                 if step == 0:
                     assert url == "https://egy.voxcinemas.com/booking/0047-276744"
-                    result = FetchResponse(base + "/guest/processing", "")
+                    result = (FetchResponse(url, _read("vox_booking_login_choice.html"))
+                              if self.login_choice else FetchResponse(base + "/guest/processing", ""))
                 elif step == 1:
                     assert url == base + "/seats/fetch"
                     result = FetchResponse(url, _read("vox_seats_fetch.html"))
@@ -1928,3 +1930,10 @@ def test_seat_watch_sold_out_page_counts_as_no_free_seats_and_rearms(tmp_path):
     alerts, proposed, failures = run_watch(watch, SeatFetch("vox_seats_soldout.html"), state, MOVIE_NOW)
     assert not alerts and not failures
     assert proposed["seat_alerted"]["seats"] == []
+
+
+def test_seat_watch_continues_as_guest_from_login_choice_page(tmp_path):
+    watch = _seat_watch(tmp_path)
+    fetch = SeatFetch("vox_seats_2.html", login_choice=True)
+    alerts, _, failures = run_watch(watch, fetch, {"notified_for": {}}, MOVIE_NOW)
+    assert not failures and len(alerts) == 1

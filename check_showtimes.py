@@ -777,9 +777,16 @@ def vox_read_seats(st: Showtime, category: str, fetch) -> Optional[list[str]]:
     """Read a guest seat map with cookies; GET only, never select or hold seats."""
     with fetch.session() as get:
         response = get(st.href, VOX_HEADERS)
-        if "/guest/processing" not in response.url:
-            raise ValueError("VOX booking did not reach guest/processing")
-        base = response.url.split("/guest/processing")[0]
+        if "/guest/processing" in response.url:
+            base = response.url.split("/guest/processing")[0]
+        else:
+            # Some sessions land on a login-or-guest choice page instead; its
+            # "Continue as Guest" link carries the same booking session.
+            guest = BeautifulSoup(response.body, "html.parser").select_one('a[href*="/seats/fetch"]')
+            if guest is None:
+                raise ValueError(f"VOX booking reached neither guest checkout nor the guest "
+                                 f"choice page: {response.url}")
+            base = urljoin(response.url, guest["href"]).split("/seats/fetch")[0]
         get(base + "/seats/fetch", VOX_HEADERS)
         xhr = {**VOX_HEADERS, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json",
                "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"}
