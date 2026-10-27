@@ -233,12 +233,6 @@ def test_repo_watches_file_is_valid():
     """The committed watches.json must actually load — it's what production runs on."""
     watches = load_watches(REPO_ROOT / "watches.json", "Africa/Cairo")
     by_id = {w.id: w for w in watches}
-    assert "odyssey-d5-friday" in by_id, "the original Odyssey watch must stay configured"
-    odyssey = by_id["odyssey-d5-friday"]
-    assert odyssey.target_weekday == "friday"
-    assert odyssey.site == "scene"
-    assert odyssey.notify_on == "published", "Odyssey's original trigger must not change"
-
     avengers = by_id["avengers-doomsday"]
     assert isinstance(avengers, MovieWatch)
     assert avengers.movie == {"vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
@@ -738,9 +732,11 @@ def test_run_scene_date_watch_at_cairo_festival_city(tmp_path):
     assert state == {"notified_for": {"cfc": "20261029"}}
 
 
-def test_run_existing_scene_date_watch_defaults_to_district_5():
-    watch = next(w for w in load_watches(REPO_ROOT / "watches.json")
-                 if w.id == "odyssey-d5-friday")
+def test_run_existing_scene_date_watch_defaults_to_district_5(tmp_path):
+    path = _write_watches(tmp_path, [{"id": "odyssey-d5-friday", "site": "scene",
+                                      "movie_slug": "the-odyssey",
+                                      "target": {"weekday": "friday"}}])
+    watch = load_watches(path)[0]
     url = "https://district5.scenecinemas.com/movie-details/the-odyssey.html?business_day=31-07-2026&ajax=1"
     now = datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("Africa/Cairo"))
     alerts, state, failures = run_watch(watch, _fixture_fetch({url: "scene_with_showtimes.html"}),

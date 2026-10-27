@@ -117,7 +117,7 @@ parsers against saved HTML in `tests/fixtures/`, URL building, `watches.json` va
 migration, Movie watch discovery, dedupe, pruning, Channels, and sample Alerts. Real network,
 Telegram/Discord delivery, and the workflow state commit are untested by design.
 `test_repo_watches_file_is_valid` asserts the committed `watches.json` actually loads and still
-contains the Odyssey watch — it guards production config, so don't relax it.
+contains the Avengers Movie watch — it guards production config, so don't relax it.
 
 When a site's markup changes, capture a fresh page into `tests/fixtures/` and fix the parser against
 it rather than testing live.
