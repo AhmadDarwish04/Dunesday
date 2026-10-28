@@ -23,6 +23,17 @@
       },
       "cinemas": ["city-centre-almaza", "district-5"],
       "channels": ["telegram"]
+    },
+    {
+      "id": "avengers-seats-almaza",
+      "site": "vox",
+      "movie": { "vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"] },
+      "cinema": "city-centre-almaza",
+      "date_range": { "from": "2026-12-16", "to": "2026-12-18" },
+      "earliest_start": "18:00",
+      "seat_category": "premium",
+      "min_free_seats": 2,
+      "channels": ["telegram"]
     }
   ]
 }   
