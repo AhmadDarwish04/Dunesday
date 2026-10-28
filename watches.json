@@ -1,54 +1,28 @@
 {
   "watches": [
     {
-      "id": "sense-almaza-oct29",
-      "site": "vox",
-      "movie_slug": "sense-and-sensibility",
-      "cinema_slug": "city-centre-almaza",
-      "target": {
-        "date": "2026-10-29"
-      },
-      "notify_on": "bookable"
-    },
-    {
       "id": "avengers-doomsday",
       "movie": {
-        "vox": [
-          "avengers-doomsday",
-          "avengers-doomsday-infinity-vision"
-        ],
+        "vox": ["avengers-doomsday", "avengers-doomsday-infinity-vision"],
         "scene": []
       },
-      "match": [
-        "doomsday"
-      ],
-      "cinemas": "all"
+      "match": {
+        "scene": ["doomsday"]
+      },
+      "cinemas": ["city-centre-almaza", "district-5"],
+      "channels": ["telegram"]
     },
     {
-      "id": "avengers-almaza-premium",
-      "kind": "seat",
-      "site": "vox",
+      "id": "dune-part-three",
       "movie": {
-        "vox": [
-          "avengers-doomsday",
-          "avengers-doomsday-infinity-vision"
-        ]
+        "vox": ["dune-part-three"],
+        "scene": []
       },
-      "match": [
-        "doomsday"
-      ],
-      "cinema_slug": "city-centre-almaza",
-      "dates": {
-        "from": "2026-12-16",
-        "to": "2026-12-18"
+      "match": {
+        "scene": ["dune"]
       },
-      "from": "18:00",
-      "category": "Premium",
-      "min_free": 2,
-      "channels": [
-        "telegram",
-        "discord"
-      ]
+      "cinemas": ["city-centre-almaza", "district-5"],
+      "channels": ["telegram"]
     }
   ]
-}
+}   
